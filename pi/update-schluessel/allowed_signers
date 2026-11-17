@@ -1,0 +1,10 @@
+# Öffentliche Update-Schlüssel von Solarmaa (Entscheid E9). Wird als /etc/solarmaa-dash/update-schluessel
+# installiert; nur damit signierte Freigaben werden auf den Pis installiert.
+#
+# Pro Zeile ein USB-Sicherheitsschlüssel (FIDO, sk-ssh-ed25519), immer mit genau diesem Anfang:
+#   update@solarmaa namespaces="solarmaa-update" sk-ssh-ed25519@openssh.com AAAA… Kommentar
+# Erwartet: Hauptschlüssel (Tin) und Ersatzschlüssel (zweite Vertrauensperson). Anleitung und
+# Fingerabdrücke: docs/15-update-pakete.md. Nie einen Testschlüssel eintragen.
+#
+# NOCH KEINE SCHLÜSSEL EINGETRAGEN. Solange diese Datei keinen Schlüssel enthält, bricht install.sh ab,
+# bevor es etwas verändert: Ein Pi bleibt dann auf seinem bisherigen Update-Weg und erhält weiter Updates.
