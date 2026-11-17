@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Verbindet diesen Pi mit dem Solarmaa-Portal: holt das neueste Programm, trägt den Portal-Block
-# in die Konfiguration ein (samt fernwartung = true; ein vorhandenes false bleibt) und startet den Dienst neu.
+# Verbindet diesen Pi mit dem Solarmaa-Portal: holt das neueste signierte Paket (solarmaa-update),
+# trägt den Portal-Block in die Konfiguration ein (samt fernwartung = true; ein vorhandenes false bleibt)
+# und startet den Dienst neu. Wird von install.sh als /usr/local/sbin/solarmaa-portal-verbinden installiert:
 #
-#   curl -fsSL https://raw.githubusercontent.com/SolarmaaTisch/solarmaa-mail-api/claude/vibrant-newton-yc8ppy/pi/portal-verbinden.sh | sudo bash -s -- TOKEN
+#   sudo solarmaa-portal-verbinden TOKEN
 set -euo pipefail
 TOKEN="${1:-}"
 URL="${SOLARMAA_PORTAL_URL:-https://uydqpixvoaznaalhygaw.supabase.co}"
@@ -13,30 +14,16 @@ CONF=/etc/solarmaa-dash/config.toml
 [[ "$TOKEN" =~ ^[0-9a-f]{40,64}$ ]] || { echo "Token fehlt oder hat ein falsches Format."; exit 1; }
 [[ -f "$CONF" ]] || { echo "Programm ist noch nicht installiert (zuerst schnellstart.sh)."; exit 1; }
 
-echo "==> Neueste Programmversion holen"
-# Direkt aus dem Repository aktualisieren (unabhängig von einer älteren Fassung von solarmaa-update).
-SRC=/opt/solarmaa-dash/src
-BRANCH=$(cat /etc/solarmaa-dash/update-branch 2>/dev/null || echo claude/vibrant-newton-yc8ppy)
+echo "==> Neueste Programmversion holen (nur signierte Pakete)"
 Z=/var/lib/solarmaa-dash/abregelung-zustand.json
 if [[ -f "$Z" ]]; then echo "    Hinweis: Zustandsdatei vorhanden: $(cat "$Z")"; fi
-if grep -q "abregelung.wechselrichter" "$CONF"; then
-  echo "    Abregelung ist konfiguriert: Update wird übersprungen, falls gerade abgeregelt wird."
-  /usr/local/sbin/solarmaa-update || true
-else
+if ! grep -q "abregelung.wechselrichter" "$CONF"; then
   rm -f "$Z"       # ohne konfigurierte Wechselrichter kann nichts begrenzt sein
-  if [[ -d "$SRC/.git" ]]; then
-    ALT=$(git -C "$SRC" rev-parse --short HEAD)
-    git -C "$SRC" fetch --quiet origin "$BRANCH"
-    git -C "$SRC" checkout --quiet --force "origin/$BRANCH"
-    if "$SRC/pi/install.sh" --update >/dev/null; then
-      echo "    Aktualisiert: $ALT → $(git -C "$SRC" rev-parse --short HEAD)"
-    else
-      echo "    Installation fehlgeschlagen, zurück auf $ALT"; git -C "$SRC" checkout --quiet --force "$ALT"; "$SRC/pi/install.sh" --update >/dev/null
-    fi
-  else
-    echo "    Kein Quellcode unter $SRC gefunden. Bitte zuerst schnellstart.sh ausführen."; exit 1
-  fi
 fi
+# solarmaa-update verschiebt selbst, solange abgeregelt wird oder eine Freigabe aussteht.
+if /usr/local/sbin/solarmaa-update; then R=ok; else R=fehler; fi
+tail -n 2 /var/log/solarmaa-dash/update.log 2>/dev/null | sed 's/^/    /' || true
+[[ $R == ok ]] || echo "    Update nicht möglich; der installierte Stand bleibt (Protokoll: /var/log/solarmaa-dash/update.log)."
 
 echo "==> Portal in die Konfiguration eintragen"
 cp -p "$CONF" "$CONF.vor-portal"

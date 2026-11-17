@@ -902,3 +902,111 @@ class WartungAnzeigeTests(unittest.TestCase):
             with mock.patch.object(wartung.Wartung, "_git", lambda self, *a: "abc1234" if "rev-parse" in a else "01.11.2026 09:00"):
                 st = w.status()
             self.assertEqual((st["commit"], st["stand"], st["weg"]), ("abc1234", "01.11.2026 09:00", "git"))
+
+
+@unittest.skipIf(SSH_KEYGEN != "/usr/bin/ssh-keygen" or shutil.which("bash") is None or shutil.which("sha256sum") is None,
+                 "braucht /usr/bin/ssh-keygen, bash und sha256sum")
+class SchnellstartTests(unittest.TestCase):
+    """pi/schnellstart.sh ohne root und ohne Netz: apt-get und curl sind Attrappen (curl kopiert aus einem
+    Temp-Ordner), der Testschlüssel ist ein normaler ed25519 (nur Test, darum die Typprüfung entschärft) und
+    der letzte Schritt (solarmaa_update.py --erstinstallation) wird nur mitgeschrieben."""
+
+    def test_eingebettete_schluessel_wie_allowed_signers(self):
+        skript = (ROOT / "pi/schnellstart.sh").read_text()
+        block = skript.split("SCHLUESSEL=$(cat <<'SCHLUESSEL'\n", 1)[1].split("\nSCHLUESSEL\n)", 1)[0] if \
+            "SCHLUESSEL=$(cat <<'SCHLUESSEL'\nSCHLUESSEL\n)" not in skript else ""
+        datei = (ROOT / "pi/update-schluessel/allowed_signers").read_text()
+        self.assertEqual([z for z in block.splitlines() if z.strip()],
+                         [z for z in datei.splitlines() if z.strip() and not z.lstrip().startswith("#")])
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="schnellstart."))
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.ablage = self.d / "ablage"
+        (self.ablage / "stabil").mkdir(parents=True)
+        self.bin = self.d / "bin"
+        self.bin.mkdir()
+        self.log = self.d / "aufrufe.log"
+        (self.bin / "apt-get").write_text(f'#!/bin/bash\necho "apt-get $*" >> "{self.log}"\n')
+        (self.bin / "curl").write_text(  # curl … -o ZIEL URL  ->  Datei aus der Ablage
+            f'#!/bin/bash\necho "curl $*" >> "{self.log}"\nwhile [[ $# -gt 0 ]]; do case $1 in -o) o=$2; shift 2;; '
+            '--max-filesize) m=$2; shift 2;; -*) shift;; *) u=$1; shift;; esac; done\n'
+            f'q="{self.ablage}/${{u#*pi-pakete/}}"; [[ -f "$q" ]] || exit 22\n'
+            '[[ $(stat -c %s "$q") -le $m ]] || exit 63\ncp "$q" "$o"\n')
+        for f in self.bin.iterdir():
+            f.chmod(0o755)
+
+    def lauf(self, schluessel_zeile: str, *args):
+        skript = (ROOT / "pi/schnellstart.sh").read_text()
+        skript = skript.replace("[[ $EUID -eq 0 ]] ||", "true ||")
+        skript = skript.replace("SCHLUESSEL=$(cat <<'SCHLUESSEL'\n", "SCHLUESSEL=$(cat <<'SCHLUESSEL'\n" + schluessel_zeile)
+        skript = skript.replace('sk-ssh-ed25519@openssh.com \' <<< "$SCHLUESSEL"', '\' <<< "$SCHLUESSEL"')
+        letzte = 'python3 -I "$T/solarmaa_update.py" --erstinstallation'
+        self.assertEqual(skript.count(letzte), 1)
+        skript = skript.replace(letzte, f'cp "$T/solarmaa_update.py" "{self.d}/geladen.py"; echo ERSTINSTALLATION')
+        pfad = self.d / "schnellstart.sh"
+        pfad.write_text(skript)
+        if self.log.exists():
+            self.log.unlink()
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        return subprocess.run(["bash", str(pfad), *args], capture_output=True, text=True, env=env, timeout=60)
+
+    def veroeffentlichen(self, schluessel_obj, paket=None):
+        paket = paket or paket_bauen("1.8.0")
+        m = manifest("1.8.0", groesse=len(paket), sha256=hashlib.sha256(paket).hexdigest())
+        mb = manifest_bytes(m)
+        (self.ablage / "stabil/freigabe.txt").write_bytes(mb + schluessel_obj.signieren(mb))
+        (self.ablage / "stabil/solarmaa-dash-1.8.0.tar.gz").write_bytes(paket)
+
+    def test_ohne_schluessel_nichts(self):
+        r = self.lauf("")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("noch keine Update-Schlüssel", r.stdout)
+        self.assertFalse(self.log.exists())
+
+    def test_gueltig_und_ungueltig(self):
+        zeile = schluessel("haupt").zeile()
+        self.veroeffentlichen(schluessel("haupt"))
+        r = self.lauf(zeile, "--hostname", "x")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ERSTINSTALLATION", r.stdout)
+        self.assertEqual((self.d / "geladen.py").read_text(), "# neu\n")         # aus dem geprüften Paket
+        (self.d / "geladen.py").unlink()
+        self.veroeffentlichen(schluessel("fremd"))                                 # fremde Signatur
+        r = self.lauf(zeile)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Signatur der Freigabe ungültig", r.stdout)
+        self.assertNotIn("solarmaa-dash-1.8.0.tar.gz", self.log.read_text())
+        self.assertFalse((self.d / "geladen.py").exists())
+        self.veroeffentlichen(schluessel("haupt"))                                 # Paket ausgetauscht
+        p = self.ablage / "stabil/solarmaa-dash-1.8.0.tar.gz"
+        p.write_bytes(paket_bauen("1.8.0", praefix="anders")[:p.stat().st_size].ljust(p.stat().st_size, b"\0"))
+        r = self.lauf(zeile)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("ERSTINSTALLATION", r.stdout)
+        self.assertFalse((self.d / "geladen.py").exists())
+
+    def test_erstinstallation_argumente(self):
+        from unittest import mock
+        aufrufe = []
+
+        class U:
+            def __init__(self, p):
+                pass
+
+            def erstinstallation(self, *a):
+                aufrufe.append(a)
+                return 0
+        with mock.patch.object(su, "Updater", U):
+            self.assertEqual(su.main(["--erstinstallation", "f", "p", "k", "stabil", "--", "--hostname", "x"]), 0)
+            self.assertEqual(su.main(["--erstinstallation", "f", "p", "k", "test", "--"]), 0)
+        self.assertEqual(aufrufe, [("f", "p", "k", "stabil", ["--hostname", "x"]), ("f", "p", "k", "test", [])])
+
+
+class OhneGitTests(unittest.TestCase):
+    def test_kein_git_mehr_auf_dem_pi(self):
+        """Updates und Erstinstallation kommen nur noch aus signierten Paketen (kein git clone/fetch)."""
+        for name in ("install.sh", "update.sh", "schnellstart.sh", "portal-verbinden.sh"):
+            befehle = "\n".join(z for z in (ROOT / "pi" / name).read_text().splitlines() if not z.lstrip().startswith("#"))
+            self.assertNotRegex(befehle, r"\bgit\b", name)
+            self.assertNotIn("raw.githubusercontent.com", befehle, name)
