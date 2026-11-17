@@ -12,14 +12,12 @@ Für Solarmaa-Monteure. Dauer vor Ort mit vorbereitetem Gerät: grob eine Stunde
    - SSH aktivieren
    - Zeitzone Europe/Zurich, Tastatur ch
 2. Pi mit LAN in der Werkstatt starten und per SSH verbinden: `ssh <benutzer>@solarmaa-muster.local`
-3. Software installieren:
+3. Software installieren, nur aus einem von Solarmaa signierten Paket ([Update-Pakete](15-update-pakete.md)):
    ```bash
-   sudo apt-get install -y git
-   git clone https://github.com/SolarmaaTisch/solarmaa-mail-api.git
-   cd solarmaa-mail-api
-   sudo ./pi/install.sh
+   curl -fsSLo schnellstart.sh https://uydqpixvoaznaalhygaw.supabase.co/storage/v1/object/public/pi-pakete/schnellstart.sh
+   echo "PRÜFSUMME  schnellstart.sh" | sha256sum -c && sudo bash schnellstart.sh --hostname solarmaa-muster
    ```
-   Ist das Repository öffentlich, braucht es dafür kein GitHub-Konto auf dem Pi. Wird es auf privat gestellt, braucht der Pi einen Zugang (siehe [Wartung](07-wartung-und-updates.md)) oder man kopiert den Ordner vom Laptop: `scp -r solarmaa-mail-api <benutzer>@solarmaa-muster.local:~`
+   `PRÜFSUMME` ist die SHA-256-Prüfsumme der aktuellen `schnellstart.sh`; sie steht hier, sobald das erste signierte Paket veröffentlicht ist (noch keine). Meldet `sha256sum` «FEHLSCHLAG», nicht weitermachen und Solarmaa fragen. Der Pi kommt auf den Kanal `stabil`; für den Test-Pi `--kanal test` anhängen. Ein GitHub-Zugang ist auf dem Pi nicht nötig.
 4. Konfiguration für den Kunden ausfüllen: `sudo nano /etc/solarmaa-dash/config.toml`
    - `[anlage]`: Name, kWp, Datum der Inbetriebnahme
    - `[installateur]`: Telefon und E-Mail von Solarmaa

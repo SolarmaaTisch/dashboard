@@ -14,6 +14,7 @@ flowchart LR
 - **Pi-Token:** Jede Anlage hat einen geheimen Token. Gespeichert ist nur sein Hash. Geht ein Pi verloren, im Portal «Neuen Pi-Token erzeugen».
 
 - **Fernwartung (Stufe 3):** Solarmaa-Konten mit Zwei-Faktor-Anmeldung können pro Anlage ein Update auslösen und die Konfiguration ändern, sofern die Fernwartung auf dem Pi eingeschaltet ist. Siehe Kapitel «Fernwartung» unten.
+- **Update-Pakete (E9):** Öffentlicher Storage-Bucket `pi-pakete` für signierte Pakete der Pis. Hochladen nur über das Supabase-Dashboard; für angemeldete und nicht angemeldete Konten gibt es keine erlaubende Regel, dazu drei einschränkende (`pakete_schranke_hochladen`, `…_aendern`, `…_loeschen`). Noch nicht eingespielt. Am echten Projekt ungeprüft: ob das Hochladen im Dashboard trotz der einschränkenden Regeln geht (es nutzt die Dienstrolle) und wie lange die öffentliche Ablage eine ersetzte `freigabe.txt` zwischenspeichert. Ablauf: [15-update-pakete.md](15-update-pakete.md).
 - **Anlagedoku:** Pro Anlage Dokumente (PDF, Bilder) mit Sichtbarkeit pro Dokument. Siehe Kapitel «Anlagedoku» unten. Ausgeliefert am 14.11.2026: Datenbank, privater Bucket `anlagedoku` und 7 Regeln im Supabase-Projekt eingespielt und kontrolliert, Portal aus `stabil` veröffentlicht. Im echten Projekt geprüft (nur Datenbank): Hochladen ohne Reservierung wird abgewiesen, auch mit Zwei-Faktor. Hochladen, Abrufen und Löschen über die Storage-Schnittstelle sind erst mit dem ersten echten Dokument geprüft.
 
 Noch nicht gebaut: Hausansicht und Rechnungen im Portal, Alarm an Solarmaa bei ausbleibendem Pi (Stufe 2).
@@ -113,7 +114,7 @@ Geheime Werte (Passwörter, Tokens, API-Keys, ntfy-Thema, Lebenszeichen-Adresse)
 |---|---|
 | wartet auf den Pi | angelegt, noch nicht abgeholt. Nach einer Stunde: **verfallen** |
 | abgeholt, läuft | der Pi hat den Befehl. Die Nutzlast ist ab jetzt in der Datenbank gelöscht |
-| erledigt | Konfiguration: der Dienst läuft nach dem Neustart mit der neuen Fassung. Update: das Update-Protokoll meldet «OK» oder «Bereits aktuell» |
+| erledigt | Konfiguration: der Dienst läuft nach dem Neustart mit der neuen Fassung. Update: das Update-Protokoll meldet «OK» oder «Bereits aktuell» (ab 1.7.0 nur signierte Pakete, siehe [15-update-pakete.md](15-update-pakete.md)) |
 | fehler | abgelehnt oder fehlgeschlagen, mit Begründung des Pi |
 | keine Quittung | abgeholt, aber seit 45 Minuten keine Antwort (Pi offline, Stromausfall). Eine späte Quittung kommt noch an |
 

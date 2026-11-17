@@ -23,6 +23,7 @@ Live-Anzeige für Kunden-Solaranlagen im Solarmaa-Design. Ein Raspberry Pi auf d
 | [Sicherheit und Fernzugriff](docs/12-sicherheit-und-fernzugriff.md) | Erreichbarkeit von aussen, Prüfbefunde, offene Entscheide |
 | [Abregelung bei negativen Preisen](docs/11-abregelung.md) | Day-Ahead (ENTSO-E), Nulleinspeisung, Feldtest PIKO CI |
 | [Batteriesteuerung (Entwurf)](docs/14-batteriesteuerung.md) | Auftrag für die aktive Batteriesteuerung, noch nicht umgesetzt |
+| [Update-Pakete](docs/15-update-pakete.md) | Signierte Updates: Schlüssel erzeugen, Update freigeben, Notfall |
 
 ## Schnellstart (Demo auf dem eigenen Rechner)
 
@@ -48,11 +49,7 @@ Nur die App ohne Pi ansehen: `app/index.html?demo` bzw. `app/haus.html?demo` im 
 
 ## Auf dem Raspberry Pi
 
-```bash
-git clone https://github.com/SolarmaaTisch/solarmaa-mail-api.git
-cd solarmaa-mail-api
-sudo ./pi/install.sh --hostname solarmaa-muster
-```
+Installiert wird nur aus einem von Solarmaa signierten Paket, mit `schnellstart.sh` aus der öffentlichen Ablage (Befehl mit Prüfsumme in der [Einbauanleitung](docs/03-einbauanleitung.md), Ablauf in [Update-Pakete](docs/15-update-pakete.md)). Auch Updates kommen nur als signierte Pakete.
 
 Danach Konfiguration in `/etc/solarmaa-dash/config.toml` anpassen. Details in der [Inbetriebnahme](docs/04-inbetriebnahme.md).
 

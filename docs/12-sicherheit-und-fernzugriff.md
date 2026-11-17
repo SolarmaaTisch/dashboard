@@ -41,10 +41,11 @@ Für Zugriff von unterwegs gibt es zwei saubere Wege:
 
 ## Bewusst offen: bitte entscheiden
 
-1. **Update-Kette.** Wer in den Update-Branch des GitHub-Repos schreiben kann, bekommt beim nächsten Update Root-Rechte auf jedem Pi, und damit Zugriff auf die Wechselrichter-Steuerung. Empfehlung:
-   - Repository auf **privat** stellen, Zwei-Faktor-Anmeldung für das GitHub-Konto.
-   - Eigener, geschützter Branch `stabil` für Kundenanlagen (in `/etc/solarmaa-dash/update-branch`), in den nur geprüfte Stände kommen.
-   - `--auto-update` bei Anlagen mit Abregelung **nicht** einschalten, Updates dort von Hand auslösen.
+1. **Update-Kette.** Ab Version 1.7.0 installieren die Pis nur noch Pakete, die Solarmaa mit einem USB-Sicherheitsschlüssel signiert hat ([15-update-pakete.md](15-update-pakete.md), Entscheid E9). Wer GitHub oder die Ablage im Internet kontrolliert, kann damit keinen Code mehr auf die Pis bringen. Restrisiken:
+   - Wer einen der beiden Sicherheitsschlüssel samt PIN hat, kann eine Version freigeben (auch eine, die die Schlüssel austauscht). Ersatzschlüssel getrennt aufbewahren, Verlust sofort melden.
+   - Wer GitHub kontrolliert, kann Code in einen Commit schmuggeln, den Solarmaa dann signiert: vor dem Signieren den Commit mit dem geprüften Stand vergleichen. Zwei-Faktor-Anmeldung für das GitHub-Konto, Repository nach dem ersten Paket-Update privat.
+   - Pis bis 1.6.x holen 1.7.0 noch einmal über git (mit dem bisherigen Risiko); die Schlüssel kommen dabei mit, Fingerabdrücke im Update-Protokoll prüfen.
+   - `--auto-update` bei Anlagen mit Abregelung **nicht** einschalten, Updates dort von Hand auslösen (der Pi verschiebt sie zwar während einer Abregelung, aber ein Neustart bleibt ein Eingriff).
 2. **Demo-Modus.** `[haus] demo = true` legt Benutzer mit bekanntem Passwort an. Nur für Vorführgeräte, nie beim Kunden.
 3. **ntfy-Thema.** Auf dem öffentlichen Server ntfy.sh kann jeder mitlesen, der den Themennamen kennt. Langen, zufälligen Namen wählen oder einen eigenen ntfy-Server mit Zugangsschutz betreiben.
 4. **Was der Wechselrichter tut, wenn der Pi ganz ausfällt** (Strom weg während Abregelung), bestimmt der PIKO CI selbst. Mit Kostal klären, ob die Vorgabe dann bestehen bleibt, und das Lebenszeichen (healthchecks.io) einrichten, damit ein Pi-Ausfall auffällt.

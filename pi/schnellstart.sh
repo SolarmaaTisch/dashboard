@@ -2,7 +2,7 @@
 # Solarmaa Energie-Dashboard: Erstinstallation aus einem von Solarmaa signierten Paket.
 #
 # Liegt im öffentlichen Bucket «pi-pakete». Nur mit geprüfter Prüfsumme ausführen (Wert in der
-# Inbetriebnahme-Checkliste, docs/04-inbetriebnahme.md, bzw. von Solarmaa):
+# Einbauanleitung, docs/03-einbauanleitung.md, Schritt A3, bzw. von Solarmaa):
 #
 #   curl -fsSLo schnellstart.sh https://uydqpixvoaznaalhygaw.supabase.co/storage/v1/object/public/pi-pakete/schnellstart.sh
 #   echo "PRÜFSUMME  schnellstart.sh" | sha256sum -c && sudo bash schnellstart.sh [--kanal test] [--hostname NAME]

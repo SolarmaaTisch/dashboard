@@ -114,9 +114,7 @@ curl -s localhost/api/health
 
 ## Software aktualisieren
 
-```bash
-cd ~/solarmaa-mail-api && git pull && sudo ./pi/install.sh
-```
+In der Wartung «Update installieren», im Portal «Update auslösen» oder per SSH `sudo solarmaa-update`. Installiert werden nur von Solarmaa signierte Pakete ([Update-Pakete](15-update-pakete.md)).
 
 Die Konfiguration bleibt erhalten, die Messwerte auch.
 
