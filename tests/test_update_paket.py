@@ -742,8 +742,18 @@ class AblaufTests(unittest.TestCase):
             fcntl.flock(halter, fcntl.LOCK_EX)
             with mock.patch.object(su, "Pfade", return_value=self.p), mock.patch.object(su, "Updater", lambda p: self.u):
                 self.assertEqual(su.main([]), su.BESETZT)
-        self.assertEqual(self.ausgabe.getvalue(), "")
+        hinweis = self.ausgabe.getvalue()
+        self.assertEqual(hinweis, "Hinweis: Ein anderes Update läuft gerade; diese Anfrage ist damit erledigt.\n")
         self.assertFalse(os.path.exists(self.p.anfrage))
+        # angehängt mitten in den laufenden Block: kein Ergebnis, bis der laufende Lauf seine Zeile schreibt
+        self.ausgabe.seek(0)
+        self.ausgabe.truncate(0)
+        self.ausgabe.write("=== Update 01.01.2030 00:00:00, Kanal stabil ===\n" + hinweis)
+        self.assertIsNone(self.ergebnis())
+        self.ausgabe.write("OK: 1.7.0 → 1.8.0 installiert (Kanal stabil, Commit 0123456).\n")
+        self.assertTrue(self.ergebnis()[0])
+        self.ausgabe.seek(0)
+        self.ausgabe.truncate(0)
         # ohne Kanal: Anfrage ebenfalls weg (sonst startet die Path-Unit immer wieder)
         Path(self.p.anfrage).write_text("x")
         os.unlink(self.p.kanal)
@@ -905,11 +915,15 @@ class InstallShTests(unittest.TestCase):
         marke = self.wurzel / "var/lib/solarmaa-update/umschalten-laeuft"
         marke.parent.mkdir(parents=True)
         marke.write_text("{}")
+        (self.bin / "systemctl").write_text(          # merkt sich, ob die Marke beim Neustart noch steht
+            f'#!/bin/bash\nif [[ -e "{marke}" ]]; then m=ja; else m=nein; fi\necho "systemctl $* marke=$m" >> "{self.log}"\n')
         self.assertEqual(self.lauf("--update", schluessel=sk_zeile()).returncode, 0)
         self.assertTrue(marke.exists())                    # aus solarmaa-update heraus: das Programm entscheidet
+        self.log.unlink()
         r = self.lauf()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(marke.exists())
+        self.assertIn("systemctl restart solarmaa-dash marke=nein", self.log.read_text())   # vor dem Neustart weg
         # Erstinstallation: Einrichtungs-Code entsteht (früher brach pipefail hier mit SIGPIPE von tr ab)
         self.assertRegex((self.wurzel / "var/lib/solarmaa-dash/einrichtung-code").read_text(), r"^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\n$")
 
@@ -1109,6 +1123,69 @@ class WerkzeugeTests(unittest.TestCase):
 class DienstStummTests(unittest.TestCase):
     """M4: Antwortet der Dienst nicht, entscheidet die Zustandsdatei der Abregelung."""
 
+    def test_dateien_des_dienstes_vorsichtig_lesen(self):
+        """root liest Dateien, die der Dienstbenutzer kontrolliert: FIFO blockiert nicht, Link wird nicht
+        verfolgt, /dev/zero frisst keinen Speicher, zu grosse Datei = unlesbar (verschieben)."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = d / "config.toml"
+        cfg.write_text('[server]\nhost = "127.0.0.4"\nport = 1\n')
+        z = d / "abregelung-zustand.json"
+        ziel = d / "frei.json"
+        ziel.write_text('{"begrenzt": false}')
+        for art in ("fifo", "link", "null", "gross"):
+            z.unlink(missing_ok=True)
+            if art == "fifo":
+                os.mkfifo(z)
+            elif art == "link":
+                z.symlink_to(ziel)                       # zeigt auf «nicht begrenzt», zählt trotzdem nicht
+            elif art == "null":
+                z.symlink_to("/dev/zero")
+            else:
+                z.write_text('{"begrenzt": false, "x": "' + "x" * 5000 + '"}')
+            with self.subTest(art=art):
+                self.assertIn("könnte ein Wechselrichter", su.abregelung_grund(str(cfg), str(d)))
+        z.unlink()
+        z.symlink_to(d / "gibt-es-nicht")                # kaputter Link: auch nicht «fehlt»
+        self.assertIsNotNone(su.abregelung_grund(str(cfg), str(d)))
+        # config.toml als FIFO oder Link auf /dev/zero: Vorgaben, kein Hängen
+        cfg.unlink()
+        os.mkfifo(cfg)
+        self.assertEqual(su._dienst_adresse(str(cfg)), "http://127.0.0.1:80")
+        cfg.unlink()
+        cfg.symlink_to("/dev/zero")
+        self.assertEqual(su._dienst_adresse(str(cfg)), "http://127.0.0.1:80")
+
+    def test_antwort_mit_frist_und_grenze(self):
+        import socket
+        import threading
+        lauscher = socket.socket()
+        lauscher.bind(("127.0.0.1", 0))
+        lauscher.listen()
+        self.addCleanup(lauscher.close)
+        stop = threading.Event()
+
+        def troepfeln():                                 # schickt alle 0,2 s ein Byte, endlos
+            c, _ = lauscher.accept()
+            c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n")
+            while not stop.is_set():
+                try:
+                    c.sendall(b" ")
+                except OSError:
+                    break
+                stop.wait(0.2)
+            c.close()
+        threading.Thread(target=troepfeln, daemon=True).start()
+        self.addCleanup(stop.set)
+        import time as _t
+        beginn = _t.monotonic()
+        with self.assertRaises(TimeoutError):
+            su._antwort_lesen(f"http://127.0.0.1:{lauscher.getsockname()[1]}/api/now", 1_000_000, 1.0)
+        self.assertLess(_t.monotonic() - beginn, 5)
+        srv, url = datei_server(self, {"/gross": b"x" * 2000})
+        with self.assertRaises(ValueError):
+            su._antwort_lesen(url + "/gross", 1000, 5)
+
     def test_zustandsdatei(self):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
@@ -1148,12 +1225,14 @@ class UpdateShTests(unittest.TestCase):
         log.write_text("=== Update 01.01.2030 00:00:00, Kanal stabil ===\n")
         vorher = log.stat().st_ino
         r = subprocess.run(["bash", str(d / "update.sh")], capture_output=True, text=True, timeout=30)
+        self.stderr = r.stderr
         return r.returncode, log.stat().st_ino == vorher, log.read_text()
 
     def test_besetzt_laesst_protokoll_stehen(self):
-        rc, gleich, text = self.lauf("(exit 75)")
-        self.assertEqual((rc, gleich), (0, True))
-        self.assertEqual(text, "=== Update 01.01.2030 00:00:00, Kanal stabil ===\n")
+        rc, gleich, text = self.lauf("(echo Hinweis: läuft; exit 75)")
+        self.assertEqual((rc, gleich), (0, True))                                    # nur angehängt, nicht ersetzt
+        self.assertEqual(text, "=== Update 01.01.2030 00:00:00, Kanal stabil ===\nHinweis: läuft\n")
+        self.assertIn("Ein anderes Update läuft gerade", self.stderr)               # bei Handaufruf sichtbar
         rc, gleich, text = self.lauf("(echo OK: x; exit 0)")
         self.assertEqual((rc, gleich), (0, False))                                  # normal: gekürzt und ersetzt
         self.assertTrue(text.endswith("OK: x\n"))

@@ -160,6 +160,12 @@ if [[ $OHNE_NEUSTART -eq 1 ]]; then
   echo "Dateien wiederhergestellt; der Dienst startet anschliessend normal."
   exit 0
 fi
+if [[ $IS_UPDATE -eq 0 ]]; then
+  # Eine Installation von Hand ersetzt einen unterbrochenen Paket-Umstieg: dessen Marke würde sonst beim
+  # nächsten Start den vorherigen Stand zurückholen. Vor dem Neustart: erst alle Dateien auf die Karte,
+  # dann Marke weg und nochmals auf die Karte. (Mit --update ruft solarmaa-update auf; es löscht selbst.)
+  sync; rm -f /var/lib/solarmaa-update/umschalten-laeuft; sync
+fi
 systemctl daemon-reload
 systemctl enable solarmaa-update-wiederherstellen.service >/dev/null
 systemctl enable --now solarmaa-dash-update.path >/dev/null
@@ -168,11 +174,6 @@ systemctl enable solarmaa-dash >/dev/null
 systemctl restart solarmaa-dash
 sleep 3
 systemctl --no-pager --lines=5 status solarmaa-dash || true
-if [[ $IS_UPDATE -eq 0 ]]; then
-  # Eine Installation von Hand ersetzt einen unterbrochenen Paket-Umstieg: dessen Marke würde sonst beim
-  # nächsten Start den vorherigen Stand zurückholen. (Mit --update ruft solarmaa-update auf; es löscht selbst.)
-  sync; rm -f /var/lib/solarmaa-update/umschalten-laeuft
-fi
 
 IP=$(hostname -I | awk '{print $1}')
 echo

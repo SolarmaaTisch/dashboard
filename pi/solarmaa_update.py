@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -380,14 +381,34 @@ def selbsttest(ssh_keygen: str) -> None:
 
 
 # ---------------------------------------------------------------- Dienst fragen
-def _dienst_adresse(config_pfad: str) -> str:
-    """Dieselbe Adresse, an die der Dienst bindet (0.0.0.0, :: und leer = alle, sonst server.host)."""
+def _klein_lesen(pfad: str, max_bytes: int) -> bytes:
+    """Liest eine Datei, die der Dienstbenutzer schreiben kann (config.toml, abregelung-zustand.json), als root
+    vorsichtig: kein Folgen von Links, nicht blockierend (FIFO), nur normale Dateien, höchstens max_bytes.
+    Alles andere: OSError bzw. ValueError."""
+    fd = os.open(pfad, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("keine normale Datei")
+        daten = os.read(fd, max_bytes + 1)
+    finally:
+        os.close(fd)
+    if len(daten) > max_bytes:
+        raise ValueError("Datei zu gross")
+    return daten
+
+
+def _toml_lesen(pfad: str) -> dict:
     import tomllib
     try:
-        with open(config_pfad, "rb") as f:
-            s = tomllib.load(f).get("server", {})
+        d = tomllib.loads(_klein_lesen(pfad, 1_000_000).decode("utf-8"))
     except Exception:  # noqa: BLE001 – ohne lesbare Konfiguration gelten die Vorgaben des Dienstes
-        s = {}
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _dienst_adresse(config_pfad: str) -> str:
+    """Dieselbe Adresse, an die der Dienst bindet (0.0.0.0, :: und leer = alle, sonst server.host)."""
+    s = _toml_lesen(config_pfad).get("server", {})
     if not isinstance(s, dict):
         s = {}
     host = "127.0.0.1" if str(s.get("host") or "") in ("", "0.0.0.0", "::") else str(s["host"])
@@ -396,12 +417,8 @@ def _dienst_adresse(config_pfad: str) -> str:
 
 def _zustand_datei(config_pfad: str, dienst_daten: str) -> str:
     """abregelung-zustand.json liegt neben der Datenbank ([daten] pfad), sonst im Datenordner des Dienstes."""
-    import tomllib
-    try:
-        with open(config_pfad, "rb") as f:
-            pfad = tomllib.load(f).get("daten", {}).get("pfad")
-    except Exception:  # noqa: BLE001
-        pfad = None
+    daten = _toml_lesen(config_pfad).get("daten", {})
+    pfad = daten.get("pfad") if isinstance(daten, dict) else None
     if isinstance(pfad, str) and pfad and pfad != ":memory:":
         return os.path.join(os.path.dirname(pfad) or ".", "abregelung-zustand.json")
     return os.path.join(dienst_daten, "abregelung-zustand.json")
@@ -411,25 +428,45 @@ def _zustand_grund(datei: str) -> str | None:
     """Dienst antwortet nicht: Zustandsdatei der Abregelung. Fehlt sie, wurde nie begrenzt (Update darf
     laufen, sonst liesse sich ein abgestürzter Dienst nie per Update reparieren). Steht dort «begrenzt»
     oder ist sie unlesbar: verschieben."""
-    if not os.path.exists(datei):
-        return None
     try:
-        with open(datei, encoding="utf-8") as f:
-            d = json.load(f)
+        os.lstat(datei)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass                                           # unlesbar: verschieben
+    try:
+        d = json.loads(_klein_lesen(datei, 4096).decode("utf-8"))
         begrenzt = d.get("begrenzt") if isinstance(d, dict) else None
-    except (OSError, ValueError):
+    except (OSError, ValueError):                      # auch Link, FIFO, Gerät, zu gross
         begrenzt = None
     if begrenzt is False:
         return None
     return "Dienst antwortet nicht und laut Zustandsdatei könnte ein Wechselrichter noch begrenzt sein"
 
 
+def _antwort_lesen(url: str, max_bytes: int, frist_s: float) -> bytes:
+    """Antwort des Dienstes mit Grössengrenze und Gesamtfrist (ein tröpfelnder Dienst hält die Sperre nicht)."""
+    ende = time.monotonic() + frist_s
+    teile, n = [], 0
+    with urllib.request.urlopen(url, timeout=5) as r:
+        while True:
+            if time.monotonic() > ende:
+                raise TimeoutError("Antwort zu langsam")
+            stueck = r.read1(65536)
+            if not stueck:
+                break
+            n += len(stueck)
+            if n > max_bytes:
+                raise ValueError("Antwort zu gross")
+            teile.append(stueck)
+    return b"".join(teile)
+
+
 def abregelung_grund(config_pfad: str, dienst_daten: str = "/var/lib/solarmaa-dash") -> str | None:
     """Grund, das Update zu verschieben, oder None. Massgebend ist der laufende Dienst (/api/now); antwortet er
     nicht, entscheidet die Zustandsdatei der Abregelung (_zustand_grund)."""
     try:
-        with urllib.request.urlopen(_dienst_adresse(config_pfad) + "/api/now", timeout=5) as r:
-            d = json.loads(r.read(1_000_000))
+        d = json.loads(_antwort_lesen(_dienst_adresse(config_pfad) + "/api/now", 1_000_000, 15))
     except Exception:  # noqa: BLE001
         return _zustand_grund(_zustand_datei(config_pfad, dienst_daten))
     a = d.get("abregelung") if isinstance(d, dict) else None
@@ -881,8 +918,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fcntl.flock(sperre, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            # Ein Lauf ist schon im Gang: nichts ins Protokoll (sein Block und seine Quittung bleiben
-            # unverändert), und update.sh kürzt das Protokoll bei diesem Code nicht.
+            # Ein Lauf ist schon im Gang. update.sh ersetzt das Protokoll bei diesem Code nicht, hängt also nur
+            # an. Die Zeile beginnt weder mit FEHLER noch OK/Bereits/Verschoben: update_ergebnis liest weiter
+            # das Ergebnis des laufenden Blocks (dessen letzte Zeile schreibt der laufende Lauf danach).
+            melden("Hinweis: Ein anderes Update läuft gerade; diese Anfrage ist damit erledigt.")
             return BESETZT
         if a.wiederherstellen:
             if not os.path.exists(p.marke):
