@@ -190,6 +190,14 @@ function piRunde(token, ordner = piDir) {
   ok("HTML im Ergebnis wird als Text gezeigt, nichts ausgeführt", (await p.evaluate(() => window.xss)) === undefined && (await p.locator("#fernBefehle img, #fernBefehle script").count()) === 0);
   await pruefen("langes Ergebnis mit HTML");
 
+  // ---------------------------------------------------------------- Update verschoben: kein roter Fehler
+  sql(`update public.befehle set status = 'fehler', ergebnis = 'Verschoben: Anlage wird gerade abgeregelt. Später erneut starten (oder: sudo solarmaa-update --erzwingen).' where id = (select id from public.befehle order by erstellt desc limit 1)`);
+  await p.tap("#back"); await p.waitForSelector(".plant"); await p.tap(".plant");
+  await p.waitForFunction(() => (document.querySelector("#fernBefehle li")?.textContent || "").includes("Verschoben:"));
+  const pille = p.locator("#fernBefehle li").first().locator(".pill");
+  ok("verschobenes Update: neutral «verschoben», nicht «fehler»",
+     (await pille.textContent()) === "verschoben" && !(await pille.getAttribute("class")).includes("bad"));
+
   // ---------------------------------------------------------------- Ablauf 9: Pi kommt nicht, Befehl verfällt
   await zweimal("#fernUpdate"); await warteStand("wartet auf den Pi");
   sql("update public.befehle set erstellt = now() - interval '2 hours' where status = 'offen'");

@@ -390,7 +390,8 @@
     if (b.status === "offen") return alt(b.erstellt, 60) ? ["off", "verfallen"] : ["cur", "wartet auf den Pi"];
     if (b.status === "gesendet") return alt(b.gesendet_am, 45) ? ["warn", "keine Quittung"] : ["cur", "abgeholt, läuft"];
     if (b.status === "erledigt") return ["ok", "erledigt"];
-    if (b.status === "fehler") return ["bad", "fehler"];
+    // «Verschoben» (Abregelung oder Freigabe ausstehend) ist kein Fehler des Pi: neutral zeigen, später erneut senden
+    if (b.status === "fehler") return /^Verschoben/.test(b.ergebnis || "") ? ["warn", "verschoben"] : ["bad", "fehler"];
     return ["off", "verfallen"];
   }
   async function loadBefehle() {
