@@ -2,10 +2,14 @@
 
 Updates laufen nicht im Webdienst selbst (der hat keine Root-Rechte), sondern über eine
 systemd-Path-Unit: Der Dienst legt die Datei update-anfrage an, systemd startet daraufhin
-solarmaa-dash-update.service (als root), das /usr/local/sbin/solarmaa-update ausführt.
+solarmaa-dash-update.service (als root), das /usr/local/sbin/solarmaa-update ausführt. Installiert
+werden nur von Solarmaa signierte Pakete (solarmaa_update.py); welcher Stand läuft, steht in
+/opt/solarmaa-dash/paket.json (vor dem ersten Paket-Update: Git-Stand in /opt/solarmaa-dash/src).
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import threading
 import time
@@ -16,6 +20,8 @@ from . import __version__
 DATEN = Path("/var/lib/solarmaa-dash")
 SRC = Path("/opt/solarmaa-dash/src")
 UPDATE_LOG = Path("/var/log/solarmaa-dash/update.log")   # gehört root; der Dienst liest nur
+PAKET_JSON = Path("/opt/solarmaa-dash/paket.json")         # schreibt solarmaa-update nach jedem Paket-Update
+KANAL_DATEI = Path("/etc/solarmaa-dash/update-kanal")
 
 
 class Wartung:
@@ -32,13 +38,42 @@ class Wartung:
         except (OSError, subprocess.SubprocessError):
             return ""
 
+    @staticmethod
+    def _paket() -> dict | None:
+        """Angaben zum installierten Paket (nur Anzeige; geprüft wurde beim Installieren)."""
+        try:
+            d = json.loads(PAKET_JSON.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not (isinstance(d, dict) and isinstance(d.get("commit"), str) and re.fullmatch(r"[0-9a-f]{7,40}", d["commit"])):
+            return None
+        return d
+
+    @staticmethod
+    def _kanal() -> str | None:
+        try:
+            k = KANAL_DATEI.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        return k if k in ("test", "stabil") else None
+
     def status(self) -> dict:
         log = UPDATE_LOG
         anfrage = self.daten / "update-anfrage"
+        paket = self._paket()
+        if paket:
+            stand = paket.get("erstellt") if isinstance(paket.get("erstellt"), str) else None
+            commit, weg = paket["commit"][:7], "paket"
+        else:
+            commit = self._git("rev-parse", "--short", "HEAD") or None
+            stand = self._git("log", "-1", "--format=%cd", "--date=format:%d.%m.%Y %H:%M") or None
+            weg = "git" if commit else None
         return {
             "version": __version__,
-            "commit": self._git("rev-parse", "--short", "HEAD") or None,
-            "stand": self._git("log", "-1", "--format=%cd", "--date=format:%d.%m.%Y %H:%M") or None,
+            "commit": commit,
+            "stand": stand[:40] if stand else None,
+            "kanal": self._kanal(),
+            "weg": weg,
             "update_wartet": anfrage.exists(),
             "update_log": log.read_text(encoding="utf-8", errors="replace")[-4000:] if log.exists() else "",
             "update_eingerichtet": Path("/etc/systemd/system/solarmaa-dash-update.path").exists(),
@@ -60,7 +95,7 @@ class Wartung:
         start = next((i for i in range(len(zeilen) - 1, -1, -1) if zeilen[i].startswith("=== Update ")), None)
         if start is None:
             return None
-        try:        # Kopfzeile: === Update TT.MM.JJJJ HH:MM:SS, Branch … ===
+        try:        # Kopfzeile: === Update TT.MM.JJJJ HH:MM:SS, Kanal … === (früher: Branch …)
             beginn = time.mktime(time.strptime(zeilen[start][11:30], "%d.%m.%Y %H:%M:%S"))
         except ValueError:
             return None

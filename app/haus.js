@@ -126,8 +126,8 @@
       async importCsv() { all(); return { neu: 0, aktualisiert: 0, nicht_zugeordnet: [], demo: true }; },
       async wartung() {
         if (!me || me.rolle !== "admin") throw new ApiFehler(403, "Nur für Solarmaa (Rolle admin)");
-        return { version: "1.1.0", commit: "demo", stand: new Date().toLocaleString(L), update_wartet: false, update_eingerichtet: true,
-          update_log: "=== Update (Beispiel) ===\nBereits aktuell (demo).", benutzer: Object.values(USERS), einheiten: E.map((e) => ({ id: e.id, name: e.name })), geraete: [{ name: "Fronius Symo GEN24", rolle: "anlage", typ: "fronius", ok: true }, { name: "Shelly Pro 3EM Netz", rolle: "netz", typ: "shelly", ok: true }],
+        return { version: "1.7.0", commit: "demo", stand: new Date().toLocaleString(L), kanal: "stabil", weg: "paket", update_wartet: false, update_eingerichtet: true,
+          update_log: "=== Update (Beispiel), Kanal stabil ===\nBereits aktuell (1.7.0).", benutzer: Object.values(USERS), einheiten: E.map((e) => ({ id: e.id, name: e.name })), geraete: [{ name: "Fronius Symo GEN24", rolle: "anlage", typ: "fronius", ok: true }, { name: "Shelly Pro 3EM Netz", rolle: "netz", typ: "shelly", ok: true }],
           geraete_fehler: {}, haus_zaehler: E.flatMap((e) => e.zaehler.map((z) => ({ id: z.id, name: `${e.name}: ${z.name}`, fehler: null }))), erkennung: scan };
       },
       async update() { return { ok: true, hinweis: "Demo: Es wird nichts installiert." }; },
@@ -439,7 +439,8 @@
   async function loadWartung() {
     const w = await guard(() => api.wartung());
     if (!w) return;
-    $("swInfo").innerHTML = `<dt>Version</dt><dd>${esc(w.version)}</dd><dt>Stand</dt><dd>${esc(w.commit || "–")} ${w.stand ? "· " + esc(w.stand) : ""}</dd><dt>Web-Update</dt><dd>${w.update_eingerichtet ? (w.update_wartet ? "läuft …" : "bereit") : "nicht eingerichtet (install.sh erneut ausführen)"}</dd>`;
+    const weg = w.weg === "paket" ? "signiertes Paket" : w.weg === "git" ? "Git (bis zum ersten Paket-Update)" : "–";
+    $("swInfo").innerHTML = `<dt>Version</dt><dd>${esc(w.version)}</dd><dt>Stand</dt><dd>${esc(w.commit || "–")} ${w.stand ? "· " + esc(w.stand) : ""}</dd><dt>Kanal</dt><dd>${esc(w.kanal || "–")}</dd><dt>Installiert aus</dt><dd>${esc(weg)}</dd><dt>Web-Update</dt><dd>${w.update_eingerichtet ? (w.update_wartet ? "läuft …" : "bereit") : "nicht eingerichtet (install.sh erneut ausführen)"}</dd>`;
     $("updateLog").textContent = w.update_log || "Noch kein Update ausgeführt.";
     if ($("updateBtn")) $("updateBtn").disabled = !w.update_eingerichtet || w.update_wartet;
     $("devList").innerHTML = (w.geraete || []).map((g) => `<li><span><span class="${g.ok ? "dot-ok" : "dot-err"}"></span>${esc(g.name)}</span><span class="muted">${esc(g.rolle)} · ${esc(g.typ)}</span></li>`).join("") || '<li class="muted">Demo-Quelle, keine echten Geräte</li>';

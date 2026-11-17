@@ -874,3 +874,31 @@ class SchluesseldateiTests(unittest.TestCase):
         for name in _SCHLUESSEL:
             if name != "_ordner":
                 self.assertNotIn(_SCHLUESSEL[name].pub[1], text)
+
+
+class WartungAnzeigeTests(unittest.TestCase):
+    """Wartungsseite: Version, Kanal, Stand aus paket.json; vorher (git) aus /opt/solarmaa-dash/src."""
+
+    def test_paket_kanal_und_rueckfall_git(self):
+        from unittest import mock
+        from solarmaa_dash import config, wartung
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        paket, kanal = d / "paket.json", d / "update-kanal"
+        w = wartung.Wartung(config.load(None), d)
+        with mock.patch.object(wartung, "PAKET_JSON", paket), mock.patch.object(wartung, "KANAL_DATEI", kanal), \
+                mock.patch.object(wartung, "SRC", d / "gibt-es-nicht"):
+            st = w.status()
+            self.assertEqual((st["commit"], st["stand"], st["kanal"], st["weg"]), (None, None, None, None))
+            paket.write_text(json.dumps({"version": "1.8.0", "kanal": "stabil", "commit": COMMIT,
+                                         "erstellt": "17.11.2026 10:00", "installiert": "17.11.2026 11:00"}))
+            kanal.write_text("test\n")
+            st = w.status()
+            self.assertEqual((st["commit"], st["stand"], st["kanal"], st["weg"]), (COMMIT[:7], "17.11.2026 10:00", "test", "paket"))
+            paket.write_text('{"commit": "<script>"}')
+            kanal.write_text("main\n")
+            st = w.status()
+            self.assertEqual((st["commit"], st["kanal"], st["weg"]), (None, None, None))
+            with mock.patch.object(wartung.Wartung, "_git", lambda self, *a: "abc1234" if "rev-parse" in a else "01.11.2026 09:00"):
+                st = w.status()
+            self.assertEqual((st["commit"], st["stand"], st["weg"]), ("abc1234", "01.11.2026 09:00", "git"))
