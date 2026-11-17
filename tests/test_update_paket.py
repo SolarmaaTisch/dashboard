@@ -729,3 +729,145 @@ class AblaufTests(unittest.TestCase):
         p.write_bytes(p.read_bytes() + b"x")
         self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "stabil", []), 1)
         self.assertIn("FEHLER: Paket passt nicht zur Freigabe", self.ausgabe.getvalue())
+
+
+def sk_zeile(kommentar="nur-test") -> str:
+    """Syntaktisch gültiger sk-ssh-ed25519-Schlüssel aus Zufallsbytes, NUR TEST (gehört zu keiner Hardware)."""
+    def s(b):
+        return struct.pack(">I", len(b)) + b
+    blob = s(b"sk-ssh-ed25519@openssh.com") + s(os.urandom(32)) + s(b"ssh:")
+    return f'update@solarmaa namespaces="solarmaa-update" sk-ssh-ed25519@openssh.com {base64.b64encode(blob).decode()} {kommentar}\n'
+
+
+@unittest.skipIf(SSH_KEYGEN != "/usr/bin/ssh-keygen" or shutil.which("bash") is None,
+                 "braucht /usr/bin/ssh-keygen und bash")
+class InstallShTests(unittest.TestCase):
+    """install.sh ohne root: Kopie, in der /etc, /var, /opt und /usr/local in einen Temp-Ordner zeigen;
+    useradd, chown, systemctl, install -o usw. sind Attrappen, die nur mitschreiben. Was root, systemd und
+    die echten Pfade tun, ist damit nur simuliert."""
+
+    ATTRAPPEN = ("apt-get", "useradd", "chown", "systemctl", "hostnamectl", "hostname", "sleep", "curl", "id")
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="install-sh."))
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.repo = self.d / "repo"
+        shutil.copytree(ROOT / "pi", self.repo / "pi", ignore=shutil.ignore_patterns("__pycache__", "solarmaa_dash"))
+        shutil.copytree(ROOT / "app", self.repo / "app")
+        (self.repo / "pi/solarmaa_dash").mkdir()
+        self.wurzel = self.d / "wurzel"
+        for o in ("etc/solarmaa-dash", "var", "opt", "usr/local/sbin", "usr/local/lib", "etc/systemd/system"):
+            (self.wurzel / o).mkdir(parents=True)
+        skript = (ROOT / "pi/install.sh").read_text()
+        w = str(self.wurzel)
+        for pfad in ("/etc/", "/var/", "/opt/", "/usr/local/"):
+            skript = skript.replace(pfad, w + pfad)
+        skript = skript.replace("[[ $EUID -eq 0 ]] ||", "true ||")
+        self.skript = self.repo / "pi/install.sh"
+        self.skript.write_text(skript)
+        self.bin = self.d / "bin"
+        self.bin.mkdir()
+        self.log = self.d / "aufrufe.log"
+        for name in self.ATTRAPPEN:
+            (self.bin / name).write_text(f'#!/bin/bash\necho "{name} $*" >> "{self.log}"\n')
+        (self.bin / "install").write_text(  # install -d / install -m … quelle ziel: ohne Besitzerwechsel
+            f'#!/bin/bash\necho "install $*" >> "{self.log}"\nd=0; a=()\n'
+            'while [[ $# -gt 0 ]]; do case $1 in -d) d=1; shift;; -m|-o|-g) shift 2;; *) a+=("$1"); shift;; esac; done\n'
+            'if [[ $d -eq 1 ]]; then mkdir -p "${a[@]}"; else cp "${a[0]}" "${a[1]}"; fi\n')
+        for f in self.bin.iterdir():
+            f.chmod(0o755)
+
+    def lauf(self, *args, schluessel: str | None = None):
+        datei = self.repo / "pi/update-schluessel/allowed_signers"
+        if schluessel is not None:
+            datei.write_text(datei.read_text() + schluessel)
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        return subprocess.run(["bash", str(self.skript), *args], capture_output=True, text=True, env=env, timeout=120)
+
+    def dateien(self):
+        return sorted(str(p.relative_to(self.wurzel)) for p in self.wurzel.rglob("*") if p.is_file())
+
+    def test_ohne_schluessel_bricht_vor_jeder_aenderung_ab(self):
+        """So wie heute: In pi/update-schluessel/allowed_signers ist noch kein Schlüssel eingetragen."""
+        (self.repo / "pi/update-schluessel/allowed_signers").write_text("# NOCH KEINE SCHLÜSSEL EINGETRAGEN\n\n")
+        vorher = self.dateien()
+        for args in (["--update"], []):
+            r = self.lauf(*args)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("Noch keine Update-Schlüssel eingetragen", r.stdout + r.stderr)
+            self.assertIn("Installation abgebrochen, nichts verändert.", r.stderr)
+            self.assertEqual(self.dateien(), vorher)
+            aufrufe = self.log.read_text() if self.log.exists() else ""
+            self.assertNotIn("useradd", aufrufe)
+            self.assertNotRegex(aufrufe, "(?m)^install ")
+            self.assertNotIn("systemctl", aufrufe)
+
+    def test_ohne_ssh_keygen_oder_mit_testschluessel_abbruch(self):
+        self.skript.write_text(self.skript.read_text().replace("[[ -x /usr/bin/ssh-keygen ]]", "[[ -x /gibt/es/nicht ]]"))
+        r = self.lauf("--update", schluessel=sk_zeile())
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ssh-keygen fehlt", r.stderr)
+        self.assertEqual(self.dateien(), [])
+        shutil.rmtree(self.d)
+        self.setUp()
+        r = self.lauf("--update", schluessel=schluessel("haupt").zeile())        # normaler Schlüssel statt USB
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nur sk-ssh-ed25519", r.stdout + r.stderr)
+        self.assertEqual(self.dateien(), [])
+
+    def test_umstieg_vom_git_update(self):
+        (self.wurzel / "etc/solarmaa-dash/update-branch").write_text("claude/entwicklung\n")
+        (self.wurzel / "opt/solarmaa-dash/pi").mkdir(parents=True)
+        (self.wurzel / "opt/solarmaa-dash/pi/alt.txt").write_text("alt")
+        zeile = sk_zeile("Haupt")
+        r = self.lauf("--update", schluessel=zeile)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        w = self.wurzel
+        self.assertFalse((w / "opt/solarmaa-dash/pi/alt.txt").exists())
+        self.assertTrue((w / "opt/solarmaa-dash/pi/install.sh").exists())
+        self.assertEqual(sorted(p.name for p in (w / "opt/solarmaa-dash").iterdir()), ["app", "pi", "releases"])
+        self.assertEqual((w / "usr/local/sbin/solarmaa-update").read_text(), (ROOT / "pi/update.sh").read_text())
+        self.assertEqual((w / "usr/local/lib/solarmaa-update/solarmaa_update.py").read_text(),
+                         (ROOT / "pi/solarmaa_update.py").read_text())
+        self.assertTrue((w / "usr/local/sbin/solarmaa-portal-verbinden").exists())
+        self.assertTrue((w / "etc/solarmaa-dash/update-schluessel").read_text().endswith(zeile))
+        self.assertEqual((w / "etc/solarmaa-dash/update-kanal").read_text(), "test\n")          # Test-Pi
+        self.assertEqual((w / "etc/solarmaa-dash/update-quelle").read_text(), (ROOT / "pi/update-quelle").read_text())
+        self.assertTrue((w / "etc/systemd/system/solarmaa-update-wiederherstellen.service").exists())
+        self.assertRegex(r.stdout, r"Update-Schlüssel: SHA256:\S+ \(sk-ssh-ed25519@openssh.com\)")
+        self.assertIn("Selbsttest Signaturprüfung: ok", r.stdout)
+        aufrufe = self.log.read_text()
+        self.assertIn("systemctl enable solarmaa-update-wiederherstellen.service", aufrufe)
+        self.assertNotIn("apt-get", aufrufe)
+        # vorhandener Kanal bleibt, --kanal setzt ihn
+        self.assertEqual(self.lauf("--update").returncode, 0)
+        self.assertEqual((w / "etc/solarmaa-dash/update-kanal").read_text(), "test\n")
+        self.assertEqual(self.lauf("--update", "--kanal", "stabil").returncode, 0)
+        self.assertEqual((w / "etc/solarmaa-dash/update-kanal").read_text(), "stabil\n")
+        self.assertEqual(self.lauf("--update", "--kanal", "main").returncode, 2)
+
+    def test_kanal_kundenanlage_und_wiederherstellung_ohne_systemctl(self):
+        (self.wurzel / "etc/solarmaa-dash/update-branch").write_text("stabil\n")
+        r = self.lauf("--update", "--ohne-neustart", schluessel=sk_zeile())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.wurzel / "etc/solarmaa-dash/update-kanal").read_text(), "stabil\n")
+        self.assertNotIn("systemctl", self.log.read_text())
+        self.assertNotIn("curl", self.log.read_text())
+        self.assertTrue((self.wurzel / "usr/local/sbin/solarmaa-update").exists())
+
+
+class SchluesseldateiTests(unittest.TestCase):
+    """pi/update-schluessel/allowed_signers: nur USB-Sicherheitsschlüssel im Namensraum solarmaa-update,
+    kein Testschlüssel. Solange keiner eingetragen ist, bricht install.sh ab (InstallShTests)."""
+
+    def test_format_namensraum_kein_testschluessel(self):
+        text = (ROOT / "pi/update-schluessel/allowed_signers").read_text(encoding="utf-8")
+        zeilen = su.schluessel_zeilen(text)            # Fehler bei jeder anderen Zeile oder anderem Typ
+        for z in text.splitlines():
+            if z.strip() and not z.lstrip().startswith("#"):
+                self.assertTrue(z.startswith('update@solarmaa namespaces="solarmaa-update" sk-ssh-ed25519@openssh.com '), z)
+                self.assertNotRegex(z.lower(), "test|beispiel|selbsttest")
+        self.assertEqual(len({b for _t, b in zeilen}), len(zeilen))       # kein Schlüssel doppelt
+        for name in _SCHLUESSEL:
+            if name != "_ordner":
+                self.assertNotIn(_SCHLUESSEL[name].pub[1], text)

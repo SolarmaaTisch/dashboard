@@ -1,0 +1,15 @@
+[Unit]
+Description=Solarmaa Dashboard: beim Umschalten unterbrochenes Update zurücknehmen
+# Nur wenn ein Update beim Umschalten unterbrochen wurde (z. B. Stromausfall). Läuft vor dem Dienst,
+# damit dieser mit einem vollständigen, vorherigen Stand startet. Scheitert es, startet der Dienst
+# trotzdem; die Marke bleibt und der nächste Update-Lauf versucht es erneut.
+ConditionPathExists=/var/lib/solarmaa-update/umschalten-laeuft
+Before=solarmaa-dash.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/solarmaa-update --wiederherstellen
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target
