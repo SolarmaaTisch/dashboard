@@ -116,6 +116,7 @@ Geheime Werte (Passwörter, Tokens, API-Keys, ntfy-Thema, Lebenszeichen-Adresse)
 | abgeholt, läuft | der Pi hat den Befehl. Die Nutzlast ist ab jetzt in der Datenbank gelöscht |
 | erledigt | Konfiguration: der Dienst läuft nach dem Neustart mit der neuen Fassung. Update: das Update-Protokoll meldet «OK» oder «Bereits aktuell» (ab 1.7.0 nur signierte Pakete, siehe [15-update-pakete.md](15-update-pakete.md)) |
 | fehler | abgelehnt oder fehlgeschlagen, mit Begründung des Pi |
+| verschoben | Update nicht gestartet, weil abgeregelt wurde oder eine Freigabe ausstand (in der Datenbank Zustand «fehler» mit Text «Verschoben: …»). Später erneut senden |
 | keine Quittung | abgeholt, aber seit 45 Minuten keine Antwort (Pi offline, Stromausfall). Eine späte Quittung kommt noch an |
 
 Der Pi lehnt ab: bei ausgeschalteter Fernwartung, **während einer Abregelung** (auch im Modus `simulation`) und solange danach die Freigabe eines Wechselrichters aussteht (Zustand nach dem Start unbekannt, letzte Vorgabe unter Nennleistung oder Schreibfehler), solange ein anderer Befehl läuft, ab dem siebten Befehl in einer Stunde, bei ungültiger Konfiguration, bei einer Änderung an gesperrten Abschnitten und wenn die Konfiguration auf dem Pi seit dem Laden im Portal geändert wurde («neu laden»).

@@ -3,7 +3,10 @@
 #   1. Auf GitHub angemeldet den freigegebenen Stand als .tar.gz herunterladen:
 #      https://github.com/SolarmaaTisch/solarmaa-mail-api/archive/<COMMIT>.tar.gz
 #      (den Commit vorher mit dem geprüften Stand vergleichen)
-#   2. powershell -ExecutionPolicy Bypass -File .\paket-signieren.ps1 -Archiv <Datei.tar.gz> -Kanal test -Schluessel $HOME\.ssh\solarmaa-update-Tin
+#   2. powershell -ExecutionPolicy Bypass -File .\paket-signieren.ps1
+#      Ohne Angaben nimmt das Skript das neueste solarmaa-mail-api-*.tar.gz im Ordner «Downloads» und die
+#      einzige Datei .ssh\solarmaa-update-* und fragt nach dem Kanal. Sonst: -Archiv <Datei> -Kanal test
+#      -Schluessel <Datei>. Ergebnis: Ordner «freigabe-<kanal>-<version>» auf dem Desktop.
 #   3. Im Supabase-Dashboard (Storage, Bucket pi-pakete) in den Ordner des Kanals hochladen:
 #      ZUERST solarmaa-dash-<version>.tar.gz, DANACH freigabe.txt (ersetzt die alte).
 #
@@ -12,24 +15,56 @@
 # den Schlüsseln aus dem Archiv selbst und legt die Dateien im Ordner «freigabe-<kanal>-<version>» ab.
 # Anleitung: docs/15-update-pakete.md
 param(
-  [Parameter(Mandatory = $true)][string]$Archiv,
+  [string]$Archiv,
   [ValidateSet("test", "stabil")][string]$Kanal,
-  [Parameter(Mandatory = $true)][string]$Schluessel
+  [string]$Schluessel
 )
 $ErrorActionPreference = "Stop"
 
 function Abbruch($Text) { Write-Host ""; Write-Host "ABBRUCH: $Text" -ForegroundColor Red; exit 1 }
 
-# ---------------------------------------------------------------- Werkzeuge
-if (-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
-  Abbruch "ssh-keygen nicht gefunden. Windows: Einstellungen > System > Optionale Features > «OpenSSH-Client» hinzufügen."
+# Version von OpenSSH lesen. «ssh -V» schreibt auf den Fehlerkanal; Windows PowerShell 5.1 würde das bei
+# $ErrorActionPreference = "Stop" als Fehler werten, darum hier lokal «Continue».
+function OpenSSH-Version {
+  $alt = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+  try { return ((& ssh -V 2>&1 | ForEach-Object { "$_" }) -join " ").Trim() } catch { return "" }
+  finally { $ErrorActionPreference = $alt }
 }
-$version = (& ssh -V 2>&1 | Out-String).Trim()
-if ($version -match 'OpenSSH_(?:for_Windows_)?(\d+)\.(\d+)') {
-  if ([int]$Matches[1] -lt 8 -or ([int]$Matches[1] -eq 8 -and [int]$Matches[2] -lt 9)) {
-    Abbruch "OpenSSH $($Matches[1]).$($Matches[2]) ist zu alt für USB-Sicherheitsschlüssel (nötig: 8.9 oder neuer)."
+function OpenSSH-Pruefen {
+  if (-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
+    Abbruch "ssh-keygen nicht gefunden. Windows: Einstellungen > System > Optionale Features > «OpenSSH-Client» hinzufügen."
+  }
+  $v = OpenSSH-Version
+  Write-Host "OpenSSH: $v"
+  if ($v -match 'OpenSSH_(?:for_Windows_)?(\d+)\.(\d+)') {
+    $haupt = [int]$Matches[1]; $neben = [int]$Matches[2]
+    if ($haupt -lt 8 -or ($haupt -eq 8 -and $neben -lt 9)) {
+      Abbruch "OpenSSH $haupt.$neben ist zu alt für USB-Sicherheitsschlüssel. Nötig ist 8.9 oder neuer (Windows-Updates installieren oder Solarmaa fragen)."
+    }
+  } else {
+    # Unbekannte Schreibweise der Version: weiter versuchen. Kann ssh-keygen keine Sicherheitsschlüssel,
+    # meldet es beim Erzeugen bzw. Signieren selbst einen Fehler und es entsteht nichts.
+    Write-Host "Version nicht erkannt; es wird trotzdem versucht (ohne Unterstützung bricht ssh-keygen selbst ab)." -ForegroundColor Yellow
   }
 }
+
+# ---------------------------------------------------------------- Werkzeuge und Dateien
+OpenSSH-Pruefen
+if (-not $Archiv) {
+  $downloads = Join-Path $HOME "Downloads"
+  $neueste = Get-ChildItem -Path $downloads -Filter "solarmaa-mail-api-*.tar.gz" -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if (-not $neueste) { Abbruch "Im Ordner $downloads liegt kein solarmaa-mail-api-*.tar.gz. Archiv von GitHub laden oder -Archiv angeben." }
+  $Archiv = $neueste.FullName
+  if ((Read-Host "Archiv: $Archiv (geladen $($neueste.LastWriteTime)). Dieses nehmen? «ja»") -ne "ja") { Abbruch "Nichts signiert." }
+}
+if (-not $Schluessel) {
+  $kandidaten = @(Get-ChildItem -Path (Join-Path $HOME ".ssh") -Filter "solarmaa-update-*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Extension -ne ".pub" })
+  if ($kandidaten.Count -ne 1) { Abbruch "Schlüsseldatei nicht eindeutig gefunden (.ssh\solarmaa-update-<Name>). Mit -Schluessel angeben." }
+  $Schluessel = $kandidaten[0].FullName
+}
+Write-Host "Schlüssel: $Schluessel"
 if (-not (Test-Path $Archiv)) { Abbruch "Archiv $Archiv nicht gefunden." }
 if (-not (Test-Path $Schluessel)) { Abbruch "Schlüsseldatei $Schluessel nicht gefunden (erzeugt mit schluessel-erzeugen.ps1)." }
 $Archiv = (Resolve-Path $Archiv).Path
@@ -82,6 +117,18 @@ $ver = $Matches[1]
 $erlaubt = Datei-Text $a "pi/update-schluessel/allowed_signers"
 $schnellstart = Datei-Text $a "pi/schnellstart.sh"
 if (-not $erlaubt -or $erlaubt -notmatch '(?m)^update@solarmaa ') { Abbruch "Im Archiv sind keine Update-Schlüssel eingetragen. So ein Paket würde kein Pi installieren." }
+# Fingerabdrücke der Schlüssel, die dieser Stand auf die Pis bringt (mit den notierten vergleichen)
+$abdruecke = @()
+foreach ($zeile in ($erlaubt -split "`n")) {
+  $t = $zeile.Trim().Split(" ")
+  if ($t.Count -ge 4 -and $t[0] -eq "update@solarmaa") {
+    $tmpPub = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($tmpPub, "$($t[2]) $($t[3])`n")
+    $kommentar = if ($t.Count -gt 4) { $t[4..($t.Count - 1)] -join " " } else { "" }
+    $abdruecke += "$((& ssh-keygen -l -f $tmpPub | Out-String).Trim().Split(' ')[1])  $kommentar"
+    Remove-Item $tmpPub
+  }
+}
 
 if (-not $Kanal) {
   $Kanal = Read-Host "Kanal (test = nur Test-Pi, stabil = alle Kunden)"
@@ -98,11 +145,13 @@ Write-Host "Kanal:    $Kanal" -ForegroundColor $(if ($Kanal -eq "stabil") { "Yel
 if ($Kanal -eq "stabil") { Write-Host "          stabil = ALLE Kundenanlagen installieren diesen Stand." -ForegroundColor Yellow }
 Write-Host "Datei:    $dateiname ($groesse Bytes)"
 Write-Host "SHA-256:  $sha"
+Write-Host "Schlüssel in diesem Stand (mit den notierten Fingerabdrücken vergleichen):"
+foreach ($a2 in $abdruecke) { Write-Host "          $a2" }
 Write-Host ""
 if ((Read-Host "Stimmt alles? Zum Signieren «ja» eingeben") -ne "ja") { Abbruch "Nichts signiert." }
 
 # ---------------------------------------------------------------- Manifest, Signatur, Freigabe
-$ziel = Join-Path (Get-Location) "freigabe-$Kanal-$ver"
+$ziel = Join-Path ([Environment]::GetFolderPath("Desktop")) "freigabe-$Kanal-$ver"
 if (Test-Path $ziel) { Abbruch "Ordner $ziel gibt es schon (alte Freigabe?). Bitte wegräumen und neu starten." }
 New-Item -ItemType Directory -Path $ziel | Out-Null
 $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -139,9 +188,11 @@ Write-Host ""
 Write-Host "Fertig: $ziel" -ForegroundColor Green
 Write-Host "Im Supabase-Dashboard, Storage, Bucket pi-pakete, Ordner «$Kanal» hochladen:"
 Write-Host "  1. $dateiname"
-Write-Host "  2. danach freigabe.txt (vorhandene ersetzen)"
+Write-Host "  2. danach freigabe.txt: die alte freigabe.txt zuerst löschen, dann die neue hochladen"
 if ($schnellstart) {
-  Write-Host "Nur bei Kanal stabil und wenn sich schnellstart.sh geändert hat: schnellstart.sh in den Hauptordner"
-  Write-Host "des Buckets und die Prüfsumme in die Inbetriebnahme-Checkliste übernehmen:"
-  Write-Host "  SHA-256 schnellstart.sh: $sSha"
+  Write-Host ""
+  Write-Host "SHA-256 schnellstart.sh: $sSha"
+  Write-Host "Mit der Prüfsumme in der Einbauanleitung (docs/03-einbauanleitung.md, Schritt A3) vergleichen. Nur wenn"
+  Write-Host "sie abweicht (schnellstart.sh wurde geändert) und Kanal stabil: schnellstart.sh in den Hauptordner des"
+  Write-Host "Buckets laden und die neue Prüfsumme dem Entwicklungsteam für die Anleitung geben."
 }

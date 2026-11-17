@@ -41,14 +41,14 @@ Ab Version 1.7.0 installiert der Pi nur noch von Solarmaa signierte Pakete (Ents
 
 1. Ein Klick auf «Update installieren» (oder ein Fernbefehl) legt die Datei `/var/lib/solarmaa-dash/update-anfrage` an. Der Webdienst selbst hat keine Root-Rechte.
 2. systemd bemerkt die Datei (`solarmaa-dash-update.path`) und startet `/usr/local/sbin/solarmaa-update` als root. Das ruft das installierte `/usr/local/lib/solarmaa-update/solarmaa_update.py` auf.
-3. Wird gerade abgeregelt oder steht die Freigabe eines Wechselrichters aus, steht im Protokoll «Verschoben» und es passiert nichts.
+3. Wird gerade abgeregelt oder steht die Freigabe eines Wechselrichters aus, steht im Protokoll «Verschoben» und es passiert nichts (im Portal: «verschoben», kein Fehler). Antwortet der Dienst nicht, entscheidet die Zustandsdatei der Abregelung (Details in [15-update-pakete.md](15-update-pakete.md)).
 4. Der Pi lädt die Freigabe seines Kanals aus dem öffentlichen Bucket `pi-pakete` (Adresse in `/etc/solarmaa-dash/update-quelle`), prüft die Unterschrift mit den Schlüsseln in `/etc/solarmaa-dash/update-schluessel` und installiert nur eine **neuere** Version. Dann lädt er das Paket, prüft Grösse und SHA-256 und entpackt es nach `/opt/solarmaa-dash/releases/<version>`.
 5. Er **führt die Tests aus** (ohne Root-Rechte) und lädt die vorhandene Konfiguration mit dem neuen Programmstand (`konfig-pruefen`, ohne Geräte anzusprechen); passt sie nicht, bleibt die alte Version und im Protokoll steht «FEHLER: Konfiguration passt nicht zur neuen Version: …».
-6. Direkt vor dem Umschalten fragt er nochmals nach der Abregelung, installiert dann und wartet bis 40 Sekunden, ob der Dienst antwortet. Sonst installiert er den vorherigen Stand wieder. Wird er beim Umschalten unterbrochen (Stromausfall), stellt `solarmaa-update-wiederherstellen.service` beim nächsten Start den vorherigen Stand her, bevor der Dienst startet.
+6. Direkt vor dem Umschalten fragt er nochmals nach der Abregelung, installiert dann und wartet etwa 40 Sekunden (höchstens gut eine Minute), ob der Dienst antwortet. Sonst installiert er den vorherigen Stand wieder. Wird er beim Umschalten unterbrochen (Stromausfall), stellt `solarmaa-update-wiederherstellen.service` beim nächsten Start den vorherigen Stand her, bevor der Dienst startet.
 
 Alles steht im Update-Protokoll (`/var/log/solarmaa-dash/update.log`). Manuell per SSH: `sudo solarmaa-update` (`--erzwingen` überspringt nur die Abfrage der Abregelung, keine Prüfung).
 
-Nächtliche automatische Prüfung (optional): `sudo ./pi/install.sh --auto-update` aus einem entpackten Paket. Sie läuft um etwa 03:17 Uhr, mit Zufallsverzögerung, damit nicht alle Anlagen gleichzeitig laden.
+Nächtliche automatische Prüfung (optional) einschalten: `sudo /opt/solarmaa-dash/releases/<version>/pi/install.sh --update --auto-update`, wobei `<version>` die installierte Version ist (Wartungsseite oder `cat /opt/solarmaa-dash/paket.json`). Vor dem ersten Paket-Update (Umstieg von git) stattdessen `sudo /opt/solarmaa-dash/src/pi/install.sh --update --auto-update`. Die Prüfung startet um 03:17 Uhr plus eine zufällige Verzögerung bis 45 Minuten, damit nicht alle Anlagen gleichzeitig laden.
 
 ### Zugang
 
