@@ -96,9 +96,13 @@ def _geheime(text: str) -> set[str]:
 def _freigabe_offen(abr) -> bool:
     """True, solange ein Wechselrichter noch begrenzt sein könnte: Zustand nach dem Start unbekannt,
     letzte Vorgabe unter der Nennleistung oder letzter Schreibversuch fehlgeschlagen. Ein Neustart
-    (Konfiguration, Update) soll erst kommen, wenn die Anlage sicher freigegeben ist. Nur lesend."""
+    (Konfiguration, Update) soll erst kommen, wenn die Anlage sicher freigegeben ist. Nur lesend.
+    Im Modus simulation wird nichts geschrieben (letzte_w ist nur gerechnet): offen ist dann nur ein
+    unbekannter Zustand nach dem Start."""
     if getattr(abr, "unbekannt", False):
         return True
+    if getattr(abr, "modus", None) == "simulation":
+        return False
     for w in getattr(abr, "wr", None) or []:
         letzte, nenn = getattr(w, "letzte_w", None), getattr(w, "nenn_w", None)
         if getattr(w, "fehler", None) or (letzte is not None and letzte != nenn):
