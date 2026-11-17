@@ -540,10 +540,12 @@ class AblaufTests(unittest.TestCase):
                 self.assertEqual(self.releases(), [])
                 self.assertEqual(self.u.aufrufe, [])
                 self.assertEqual(m["groesse"], len(echt))
+                self.assertEqual(os.listdir(self.p.zustand), [])                 # kein paket.tmp
         self.dateien["/pi-pakete/stabil/solarmaa-dash-1.8.0.tar.gz"] = (echt[:100], len(echt))   # Download bricht ab
         self.assertEqual(self.lauf(), 1)
         self.assertIn("abgebrochen", self.ausgabe.getvalue().splitlines()[-1])
         self.assertEqual(self.releases(), [])
+        self.assertEqual(os.listdir(self.p.zustand), [])
 
     def test_freigabe_zu_gross(self):
         self.veroeffentlichen("1.8.0")
@@ -594,7 +596,7 @@ class AblaufTests(unittest.TestCase):
                 self.assertEqual([a for a in self.u.aufrufe if a[0] == "install"],
                                  [("install", "1.8.0", False), ("install", "vorher-1.7.0", False)])
                 self.assertIn("zurück auf 1.7.0", self.ausgabe.getvalue())
-                self.assertIn("Alte Version vorher-1.7.0 wiederhergestellt.", self.ausgabe.getvalue())
+                self.assertIn("Alte Version 1.7.0 wiederhergestellt.", self.ausgabe.getvalue())
                 self.assertEqual(self.releases(), ["vorher-1.7.0"])
                 self._unveraendert()
 
@@ -603,7 +605,7 @@ class AblaufTests(unittest.TestCase):
         self.u.install_ok = [False, False]           # neu scheitert, Rückweg scheitert auch
         self.assertEqual(self.lauf(), 1)
         self.assertTrue(os.path.exists(self.p.marke))
-        self.assertIn("FEHLER: Wiederherstellung von vorher-1.7.0 fehlgeschlagen", self.ausgabe.getvalue())
+        self.assertIn("FEHLER: Wiederherstellung von Version 1.7.0 fehlgeschlagen", self.ausgabe.getvalue())
         # Systemstart: solarmaa-update --wiederherstellen (ohne Neustart des Dienstes)
         self.u.install_ok, self.u.aufrufe = [True], []
         self.assertEqual(self.u.wiederherstellen(ohne_neustart=True), 0)
@@ -641,6 +643,7 @@ class AblaufTests(unittest.TestCase):
         ok, zeile = self.ergebnis()
         self.assertFalse(ok)
         self.assertIn("beim Umschalten unterbrochen", zeile)
+        self.assertTrue(zeile.endswith("Alte Version 1.7.0 wiederhergestellt."), zeile)   # Ergebnis in derselben Zeile
 
     def test_abregelung_verschiebt(self):
         self.veroeffentlichen("1.8.0")
@@ -707,6 +710,47 @@ class AblaufTests(unittest.TestCase):
         self.assertEqual(self.releases(), [])
         self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
 
+    def test_reihenfolge_auf_karte_marke_installiert(self):
+        """M1/M2: vor dem Setzen der Marke alles auf die Karte; nach Erfolg zuerst auf die Karte, dann Marke weg,
+        erst dann installiert.json (sonst meldet installiert.json nach einem Stromausfall die falsche Version)."""
+        from unittest import mock
+        ereignisse = []
+        echt_loeschen = su._loeschen_dauerhaft
+        self.veroeffentlichen("1.8.0")
+        with mock.patch.object(su, "_auf_karte", lambda: ereignisse.append(("sync", os.path.exists(self.p.marke)))), \
+                mock.patch.object(su, "_loeschen_dauerhaft", lambda pfad: (ereignisse.append(
+                    ("marke weg", os.path.exists(self.p.installiert))), echt_loeschen(pfad))):
+            self.assertEqual(self.lauf(), 0, self.ausgabe.getvalue())
+        self.assertEqual(ereignisse, [("sync", False), ("sync", True), ("marke weg", False)])
+        self.assertEqual(self.installiert()["version"], "1.8.0")
+
+    def test_installiert_json_wird_mit_dem_programm_abgeglichen(self):
+        """M2: installiert.json nennt 1.8.0, im Programm steht aber 1.7.0 (Stromausfall nach der Wiederherstellung):
+        nicht «Bereits aktuell», sondern 1.8.0 installieren, Rückweg ist eine Kopie des tatsächlichen Stands."""
+        su._schreiben(self.p.installiert, json.dumps({"version": "1.8.0", "release": "1.8.0", "vorher": None}).encode(), 0o600)
+        self.veroeffentlichen("1.8.0")
+        self.assertEqual(self.lauf(), 0, self.ausgabe.getvalue())
+        self.assertIn("installiert ist 1.7.0", self.ausgabe.getvalue())
+        self.assertIn("OK: 1.7.0 → 1.8.0", self.ausgabe.getvalue())
+        self.assertEqual(self.installiert()["vorher"], "vorher-1.7.0")
+
+    def test_besetzt_kein_eintrag_und_anfrage_weg(self):
+        """M3: Läuft schon ein Update, schreibt ein zweiter Aufruf nichts und meldet 75; die Anfrage ist trotzdem weg."""
+        import fcntl
+        from unittest import mock
+        with open(self.p.sperre, "w") as halter:
+            fcntl.flock(halter, fcntl.LOCK_EX)
+            with mock.patch.object(su, "Pfade", return_value=self.p), mock.patch.object(su, "Updater", lambda p: self.u):
+                self.assertEqual(su.main([]), su.BESETZT)
+        self.assertEqual(self.ausgabe.getvalue(), "")
+        self.assertFalse(os.path.exists(self.p.anfrage))
+        # ohne Kanal: Anfrage ebenfalls weg (sonst startet die Path-Unit immer wieder)
+        Path(self.p.anfrage).write_text("x")
+        os.unlink(self.p.kanal)
+        with mock.patch.object(su, "Pfade", return_value=self.p), mock.patch.object(su, "Updater", lambda p: self.u):
+            self.assertEqual(su.main([]), 1)
+        self.assertFalse(os.path.exists(self.p.anfrage))
+
     def test_erstinstallation(self):
         from unittest import mock
         m = self.veroeffentlichen("1.8.0")
@@ -720,11 +764,19 @@ class AblaufTests(unittest.TestCase):
                 return echt(args, **k)
             aufrufe.append(args)
             return subprocess.CompletedProcess(args, 0)
-        with mock.patch.object(su.subprocess, "run", install_attrappe):
+        su._schreiben(self.p.marke, b'{"zurueck": "vorher-1.6.0"}', 0o600)           # alter, unterbrochener Umstieg
+        echt_entpacken, entpackt = su.entpacken, []
+
+        def entpacken_spion(quelle, *a):
+            entpackt.append(quelle)
+            return echt_entpacken(quelle, *a)
+        with mock.patch.object(su.subprocess, "run", install_attrappe), mock.patch.object(su, "entpacken", entpacken_spion):
             self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "test", []), 1)   # falscher Kanal
             self.assertEqual(aufrufe, [])
             self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "stabil", ["--hostname", "x"]), 0)
+        self.assertEqual(entpackt, [os.path.join(self.p.zustand, "paket.tmp")])     # T2: nur die Kopie im Zustandsordner
         self.assertEqual(aufrufe, [[os.path.join(self.p.releases, "1.8.0", "pi", "install.sh"), "--kanal", "stabil", "--hostname", "x"]])
+        self.assertEqual(os.listdir(self.p.zustand), ["installiert.json"])           # Kopie wieder weg, keine Marke
         self.assertEqual(self.installiert()["sha256"], m["sha256"])
         p.write_bytes(p.read_bytes() + b"x")
         self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "stabil", []), 1)
@@ -848,6 +900,18 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(self.lauf("--update", "--kanal", "stabil").returncode, 0)
         self.assertEqual((w / "etc/solarmaa-dash/update-kanal").read_text(), "stabil\n")
         self.assertEqual(self.lauf("--update", "--kanal", "main").returncode, 2)
+
+    def test_installation_von_hand_loescht_alte_marke(self):
+        marke = self.wurzel / "var/lib/solarmaa-update/umschalten-laeuft"
+        marke.parent.mkdir(parents=True)
+        marke.write_text("{}")
+        self.assertEqual(self.lauf("--update", schluessel=sk_zeile()).returncode, 0)
+        self.assertTrue(marke.exists())                    # aus solarmaa-update heraus: das Programm entscheidet
+        r = self.lauf()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(marke.exists())
+        # Erstinstallation: Einrichtungs-Code entsteht (früher brach pipefail hier mit SIGPIPE von tr ab)
+        self.assertRegex((self.wurzel / "var/lib/solarmaa-dash/einrichtung-code").read_text(), r"^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\n$")
 
     def test_kanal_kundenanlage_und_wiederherstellung_ohne_systemctl(self):
         (self.wurzel / "etc/solarmaa-dash/update-branch").write_text("stabil\n")
@@ -1034,4 +1098,63 @@ class WerkzeugeTests(unittest.TestCase):
         for name in ("paket-signieren.ps1", "schluessel-erzeugen.ps1"):      # Windows PowerShell 5.1 braucht das BOM für Umlaute
             self.assertTrue((ROOT / "werkzeuge" / name).read_bytes().startswith(b"\xef\xbb\xbf"), name)
         self.assertIn('-n solarmaa-update', text)
-        self.assertIn('"-t", "ed25519-sk"', (ROOT / "werkzeuge/schluessel-erzeugen.ps1").read_text(encoding="utf-8-sig"))
+        erzeugen = (ROOT / "werkzeuge/schluessel-erzeugen.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"-O", "verify-required", "-t", "ed25519-sk"', erzeugen)      # PIN-Pflicht immer
+        self.assertNotIn("OhnePinPflicht", erzeugen)
+        for t in (text, erzeugen):        # «ssh -V» nur über die Hilfe mit lokalem «Continue» (Windows PowerShell 5.1)
+            self.assertNotIn("& ssh -V 2>&1 | Out-String", t)
+            self.assertIn('$ErrorActionPreference = "Continue"', t)
+
+
+class DienstStummTests(unittest.TestCase):
+    """M4: Antwortet der Dienst nicht, entscheidet die Zustandsdatei der Abregelung."""
+
+    def test_zustandsdatei(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = d / "config.toml"
+        cfg.write_text('[server]\nhost = "127.0.0.4"\nport = 1\n')                 # niemand antwortet
+        z = d / "abregelung-zustand.json"
+        self.assertIsNone(su.abregelung_grund(str(cfg), str(d)))                   # nie begrenzt: Update darf laufen
+        z.write_text('{"begrenzt": false, "ts": 1}')
+        self.assertIsNone(su.abregelung_grund(str(cfg), str(d)))
+        for inhalt in ('{"begrenzt": true, "ts": 1}', "kaputt", "[]", '{"ts": 1}'):
+            z.write_text(inhalt)
+            self.assertIn("könnte ein Wechselrichter noch begrenzt sein", su.abregelung_grund(str(cfg), str(d)), inhalt)
+        # [daten] pfad bestimmt den Ordner der Zustandsdatei
+        anders = d / "anders"
+        anders.mkdir()
+        cfg.write_text(f'[server]\nhost = "127.0.0.4"\nport = 1\n[daten]\npfad = "{anders}/data.db"\n')
+        self.assertIsNone(su.abregelung_grund(str(cfg), str(d)))
+        (anders / "abregelung-zustand.json").write_text('{"begrenzt": true}')
+        self.assertIsNotNone(su.abregelung_grund(str(cfg), str(d)))
+
+
+@unittest.skipIf(shutil.which("bash") is None, "braucht bash")
+class UpdateShTests(unittest.TestCase):
+    """M3: update.sh ersetzt das Protokoll nicht, wenn schon ein Lauf im Gang ist (Exit 75)."""
+
+    def lauf(self, befehl: str):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        skript = (ROOT / "pi/update.sh").read_text()
+        skript = skript.replace("LOGDIR=/var/log/solarmaa-dash", f"LOGDIR={d}")
+        skript = skript.replace('install -d -m 755 -o root -g root "$LOGDIR"', ":")
+        zeile = 'python3 -I /usr/local/lib/solarmaa-update/solarmaa_update.py "$@"'
+        self.assertIn(zeile, skript)
+        skript = skript.replace(zeile, befehl)
+        (d / "update.sh").write_text(skript)
+        log = d / "update.log"
+        log.write_text("=== Update 01.01.2030 00:00:00, Kanal stabil ===\n")
+        vorher = log.stat().st_ino
+        r = subprocess.run(["bash", str(d / "update.sh")], capture_output=True, text=True, timeout=30)
+        return r.returncode, log.stat().st_ino == vorher, log.read_text()
+
+    def test_besetzt_laesst_protokoll_stehen(self):
+        rc, gleich, text = self.lauf("(exit 75)")
+        self.assertEqual((rc, gleich), (0, True))
+        self.assertEqual(text, "=== Update 01.01.2030 00:00:00, Kanal stabil ===\n")
+        rc, gleich, text = self.lauf("(echo OK: x; exit 0)")
+        self.assertEqual((rc, gleich), (0, False))                                  # normal: gekürzt und ersetzt
+        self.assertTrue(text.endswith("OK: x\n"))
+        self.assertEqual(self.lauf("(exit 1)")[0], 1)

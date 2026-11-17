@@ -55,6 +55,7 @@ SIG_ENDE = b"-----END SSH SIGNATURE-----"
 SCHLUESSELTYP = "sk-ssh-ed25519@openssh.com"
 VERSION_RE = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}")
 UMGEBUNG = {"LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+BESETZT = 75          # Exit-Code: ein anderer Lauf hält die Sperre (update.sh lässt das Protokoll dann in Ruhe)
 
 
 class UpdateFehler(Exception):
@@ -78,6 +79,7 @@ class Pfade:
         self.releases = os.path.join(ziel, "releases")
         self.paket_json = os.path.join(ziel, "paket.json")
         self.anfrage = os.path.join(dienst_daten, "update-anfrage")
+        self.dienst_daten = dienst_daten
         self.ssh_keygen = ssh_keygen
 
 
@@ -392,14 +394,44 @@ def _dienst_adresse(config_pfad: str) -> str:
     return f"http://{f'[{host}]' if ':' in host else host}:{s.get('port', 80)}"
 
 
-def abregelung_grund(config_pfad: str) -> str | None:
-    """Grund, das Update zu verschieben, oder None. Massgebend ist der laufende Dienst (/api/now);
-    ist er nicht erreichbar, darf das Update laufen (wie bisher)."""
+def _zustand_datei(config_pfad: str, dienst_daten: str) -> str:
+    """abregelung-zustand.json liegt neben der Datenbank ([daten] pfad), sonst im Datenordner des Dienstes."""
+    import tomllib
+    try:
+        with open(config_pfad, "rb") as f:
+            pfad = tomllib.load(f).get("daten", {}).get("pfad")
+    except Exception:  # noqa: BLE001
+        pfad = None
+    if isinstance(pfad, str) and pfad and pfad != ":memory:":
+        return os.path.join(os.path.dirname(pfad) or ".", "abregelung-zustand.json")
+    return os.path.join(dienst_daten, "abregelung-zustand.json")
+
+
+def _zustand_grund(datei: str) -> str | None:
+    """Dienst antwortet nicht: Zustandsdatei der Abregelung. Fehlt sie, wurde nie begrenzt (Update darf
+    laufen, sonst liesse sich ein abgestürzter Dienst nie per Update reparieren). Steht dort «begrenzt»
+    oder ist sie unlesbar: verschieben."""
+    if not os.path.exists(datei):
+        return None
+    try:
+        with open(datei, encoding="utf-8") as f:
+            d = json.load(f)
+        begrenzt = d.get("begrenzt") if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        begrenzt = None
+    if begrenzt is False:
+        return None
+    return "Dienst antwortet nicht und laut Zustandsdatei könnte ein Wechselrichter noch begrenzt sein"
+
+
+def abregelung_grund(config_pfad: str, dienst_daten: str = "/var/lib/solarmaa-dash") -> str | None:
+    """Grund, das Update zu verschieben, oder None. Massgebend ist der laufende Dienst (/api/now); antwortet er
+    nicht, entscheidet die Zustandsdatei der Abregelung (_zustand_grund)."""
     try:
         with urllib.request.urlopen(_dienst_adresse(config_pfad) + "/api/now", timeout=5) as r:
             d = json.loads(r.read(1_000_000))
     except Exception:  # noqa: BLE001
-        return None
+        return _zustand_grund(_zustand_datei(config_pfad, dienst_daten))
     a = d.get("abregelung") if isinstance(d, dict) else None
     if not isinstance(a, dict):
         return None
@@ -442,6 +474,22 @@ def _schreiben(pfad: str, daten: bytes, modus: int) -> None:
             os.unlink(tmp)
         raise
     dfd = os.open(ordner, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _auf_karte() -> None:
+    """Alles Geschriebene auf die Karte bringen (ext4 schreibt sonst verzögert). Vor dem Setzen und vor dem
+    Löschen der Marke: Nach einem Stromausfall darf weder eine Marke ohne vollständige Dateien noch ein
+    gelöschte Marke vor den neuen Dateien auf der Karte stehen."""
+    os.sync()
+
+
+def _loeschen_dauerhaft(pfad: str) -> None:
+    os.unlink(pfad)
+    dfd = os.open(os.path.dirname(pfad), os.O_RDONLY)
     try:
         os.fsync(dfd)
     finally:
@@ -492,7 +540,7 @@ class Updater:
 
     # -- Schritte mit Wirkung nach aussen (in Tests ersetzt)
     def abregelung_grund(self) -> str | None:
-        return abregelung_grund(self.p.config)
+        return abregelung_grund(self.p.config, self.p.dienst_daten)
 
     def dienst_antwortet(self) -> bool:
         return dienst_antwortet(self.p.config)
@@ -547,11 +595,13 @@ class Updater:
     def installiert(self) -> dict:
         """Installierter Stand: installiert.json, sonst (erster Paket-Update nach git) die Version im Programm."""
         d = _json_lesen(self.p.installiert)
-        if d and isinstance(d.get("version"), str) and VERSION_RE.fullmatch(d["version"]):
+        v = version_aus_quelle(self.p.ziel)        # was tatsächlich in /opt/solarmaa-dash/pi steht
+        if d and isinstance(d.get("version"), str) and VERSION_RE.fullmatch(d["version"]) and d["version"] == v:
             return d
-        v = version_aus_quelle(self.p.ziel)
         if v is None:
             raise UpdateFehler("Installierte Version nicht feststellbar")
+        if d:
+            melden(f"Hinweis: installiert.json nennt {d.get('version')!r}, installiert ist {v}; massgebend ist {v}.")
         return {"version": v, "release": None, "vorher": None}
 
     def _release_ok(self, name) -> bool:
@@ -608,10 +658,15 @@ class Updater:
                 melden(f"Bereits aktuell ({inst['version']}; freigegeben ist die ältere {m['version']}, sie wird nicht installiert).")
             return None, None
         tmp = os.path.join(self.p.zustand, "paket.tmp")
-        with open(tmp, "wb") as f:
-            _d, n, h = laden(f"{quelle}/{kanal}/{m['datei']}", m["groesse"], f, nur_https=self.nur_https)
-        if n != m["groesse"] or h != m["sha256"]:
-            raise UpdateFehler("Paket passt nicht zur Freigabe (Grösse oder SHA-256)")
+        try:
+            with open(tmp, "wb") as f:
+                _d, n, h = laden(f"{quelle}/{kanal}/{m['datei']}", m["groesse"], f, nur_https=self.nur_https)
+            if n != m["groesse"] or h != m["sha256"]:
+                raise UpdateFehler("Paket passt nicht zur Freigabe (Grösse oder SHA-256)")
+        except BaseException:
+            with _still():
+                os.unlink(tmp)
+            raise
         name = m["version"]
         ziel = os.path.join(self.p.releases, name)
         shutil.rmtree(ziel + ".tmp", ignore_errors=True)
@@ -681,41 +736,54 @@ class Updater:
                 melden(f"Verschoben: {grund}. Später erneut starten (oder: sudo solarmaa-update --erzwingen).")
                 return 0
         zurueck = self.rueckweg(inst)
-        _schreiben(self.p.marke, json.dumps({"ziel": name, "zurueck": zurueck, "beginn": _jetzt()}).encode(), 0o600)
+        _auf_karte()                                   # Release und Rückweg vollständig, bevor die Marke steht
+        _schreiben(self.p.marke, json.dumps({"ziel": name, "zurueck": zurueck, "zurueck_version": inst["version"],
+                                             "beginn": _jetzt()}).encode(), 0o600)
         try:
             ok = self.installieren(release) and self.dienst_antwortet()
         except Exception as e:  # noqa: BLE001 – jeder Fehler hier führt zurück
             melden(f"Fehler beim Umschalten ({type(e).__name__})")
             ok = False
         if ok:
+            # Erst alles von install.sh Geschriebene auf die Karte, dann Marke weg, dann installiert.json.
+            # Stromausfall dazwischen: neuer Stand läuft, installiert.json nennt den alten; installiert()
+            # gleicht mit dem tatsächlich installierten Programm ab.
+            _auf_karte()
+            _loeschen_dauerhaft(self.p.marke)
             self._abschliessen(m, name, zurueck)
-            os.unlink(self.p.marke)
             self.aufraeumen({name, zurueck})
             melden(f"OK: {inst['version']} → {m['version']} installiert (Kanal {kanal}, Commit {m['commit'][:7]}).")
             return 0
         melden(f"FEHLER bei der Installation oder der Dienst antwortet nach dem Neustart nicht, zurück auf {inst['version']}")
-        if self.wiederherstellen() == 0:
+        if self.wiederherstellen(praefix="Hinweis: ") == 0:
             shutil.rmtree(release, ignore_errors=True)
         return 1
 
-    def wiederherstellen(self, ohne_neustart: bool = False) -> int:
-        """Vorherigen Stand aus der Marke neu installieren. Marke bleibt, wenn das scheitert."""
+    def wiederherstellen(self, ohne_neustart: bool = False, praefix: str = "") -> int:
+        """Vorherigen Stand aus der Marke neu installieren. Marke bleibt, wenn das scheitert.
+        Das Ergebnis steht in einer Zeile; mit praefix «FEHLER: …» ist es die Fehlerzeile des Laufs."""
+        def fehler(text):
+            melden(f"{praefix}{text}" if praefix.startswith("FEHLER") else f"FEHLER: {text}")
         marke = _json_lesen(self.p.marke)
         if marke is None:
             if os.path.exists(self.p.marke):
-                melden("FEHLER: Marke des unterbrochenen Updates unlesbar; bitte vor Ort prüfen (sudo solarmaa-update).")
+                fehler("Marke des unterbrochenen Updates unlesbar; bitte vor Ort prüfen (sudo solarmaa-update).")
                 return 1
             return 0
         zurueck = marke.get("zurueck")
-        if not (isinstance(zurueck, str) and _NAME_RE.fullmatch(zurueck) and not zurueck.startswith(".")
-                and self._release_ok(zurueck)):
-            melden(f"FEHLER: Vorheriger Stand {zurueck!r} fehlt; Wiederherstellung nicht möglich, bitte vor Ort prüfen.")
+        ok_name = isinstance(zurueck, str) and _NAME_RE.fullmatch(zurueck) and not zurueck.startswith(".")
+        version = marke.get("zurueck_version")
+        if not (isinstance(version, str) and VERSION_RE.fullmatch(version)):
+            version = zurueck.removeprefix("vorher-") if ok_name else "?"
+        if not (ok_name and self._release_ok(zurueck)):
+            fehler(f"Vorheriger Stand {version} fehlt; Wiederherstellung nicht möglich, bitte vor Ort prüfen.")
             return 1
         if not self.installieren(os.path.join(self.p.releases, zurueck), ohne_neustart):
-            melden(f"FEHLER: Wiederherstellung von {zurueck} fehlgeschlagen; wird beim nächsten Lauf erneut versucht.")
+            fehler(f"Wiederherstellung von Version {version} fehlgeschlagen; wird beim nächsten Lauf erneut versucht.")
             return 1
-        os.unlink(self.p.marke)
-        melden(f"Alte Version {zurueck} wiederhergestellt.")
+        _auf_karte()
+        _loeschen_dauerhaft(self.p.marke)
+        melden(f"{praefix}Alte Version {version} wiederhergestellt.")
         return 0
 
     # -- Erstinstallation (schnellstart.sh)
@@ -727,11 +795,17 @@ class Updater:
             if len(daten) > MAX_FREIGABE:
                 raise UpdateFehler("Freigabe zu gross")
             m = freigabe_pruefen(daten, schluessel, self.p.ssh_keygen, kanal)
+            # Paket zuerst in den Zustandsordner (root, 700) kopieren; geprüft und entpackt wird nur die Kopie
+            os.makedirs(self.p.zustand, 0o700, exist_ok=True)
+            kopie = os.path.join(self.p.zustand, "paket.tmp")
             h, n = hashlib.sha256(), 0
-            with open(paket, "rb") as f:
-                for stueck in iter(lambda: f.read(65536), b""):
+            with open(paket, "rb") as ein, open(kopie, "wb") as aus:
+                for stueck in iter(lambda: ein.read(65536), b""):
                     n += len(stueck)
+                    if n > MAX_PAKET:
+                        raise UpdateFehler("Paket zu gross")
                     h.update(stueck)
+                    aus.write(stueck)
             if n != m["groesse"] or h.hexdigest() != m["sha256"]:
                 raise UpdateFehler("Paket passt nicht zur Freigabe (Grösse oder SHA-256)")
             alt = _json_lesen(self.p.installiert)
@@ -744,7 +818,7 @@ class Updater:
             ziel = os.path.join(self.p.releases, name)
             shutil.rmtree(ziel + ".tmp", ignore_errors=True)
             try:
-                entpacken(paket, ziel + ".tmp", m["version"], m["commit"])
+                entpacken(kopie, ziel + ".tmp", m["version"], m["commit"])
             except BaseException:
                 shutil.rmtree(ziel + ".tmp", ignore_errors=True)
                 raise
@@ -753,12 +827,18 @@ class Updater:
         except UpdateFehler as e:
             melden(f"FEHLER: {e}. Nichts installiert.")
             return 1
+        finally:
+            with _still():
+                os.unlink(os.path.join(self.p.zustand, "paket.tmp"))
         melden(f"Signatur und Paket geprüft: Version {m['version']}, Kanal {kanal}, Commit {m['commit'][:7]}.")
         sys.stdout.flush()
         r = subprocess.run([os.path.join(ziel, "pi", "install.sh"), "--kanal", kanal, *install_args], stdin=subprocess.DEVNULL)
         if r.returncode != 0:
             melden("FEHLER: install.sh ist fehlgeschlagen.")
             return 1
+        _auf_karte()
+        if os.path.exists(self.p.marke):             # ein alter, unterbrochener Umstieg gilt nicht mehr
+            _loeschen_dauerhaft(self.p.marke)
         self._abschliessen(m, name, None)
         return 0
 
@@ -791,21 +871,25 @@ def main(argv: list[str] | None = None) -> int:
     u = Updater(p)
     if a.erstinstallation:
         return u.erstinstallation(*a.erstinstallation, a.install_args)
+    if not a.wiederherstellen:
+        # Als Erstes: Sonst startet die Path-Unit den Dienst immer wieder, solange die Datei steht.
+        with _still():
+            os.unlink(p.anfrage)
     os.makedirs(p.zustand, 0o700, exist_ok=True)
     os.makedirs(p.releases, 0o755, exist_ok=True)
     with open(p.sperre, "w") as sperre:
         try:
             fcntl.flock(sperre, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            melden(f"=== Update {_jetzt()}, Kanal - ===")
-            melden("FEHLER: Ein anderes Update läuft gerade.")
-            return 1
+            # Ein Lauf ist schon im Gang: nichts ins Protokoll (sein Block und seine Quittung bleiben
+            # unverändert), und update.sh kürzt das Protokoll bei diesem Code nicht.
+            return BESETZT
         if a.wiederherstellen:
             if not os.path.exists(p.marke):
                 return 0
             # gehört zum unterbrochenen Lauf: dessen Ergebnis ist ein Fehler (wartung.update_ergebnis)
-            melden(f"FEHLER: Update beim Umschalten unterbrochen (z. B. Stromausfall), {_jetzt()}: vorheriger Stand wird wiederhergestellt.")
-            return u.wiederherstellen(ohne_neustart=True)
+            return u.wiederherstellen(ohne_neustart=True,
+                                      praefix=f"FEHLER: Update beim Umschalten unterbrochen (z. B. Stromausfall, {_jetzt()}): ")
         return u.aktualisieren(a.erzwingen)
 
 

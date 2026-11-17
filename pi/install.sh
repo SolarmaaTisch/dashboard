@@ -104,7 +104,9 @@ chown root:"$USER_NAME" "$CONF_DIR/config.toml"; chmod 660 "$CONF_DIR/config.tom
 # Einmal-Code für die Ersteinrichtung im Browser (erster Admin). Wird nach Gebrauch gelöscht.
 CODE_DATEI=/var/lib/solarmaa-dash/einrichtung-code
 if [[ $IS_UPDATE -eq 0 && ! -f "$CODE_DATEI" ]]; then
-  CODE=$(tr -dc 'A-HJ-NP-Z2-9' < /dev/urandom | head -c 8)
+  # tr endet mit SIGPIPE, sobald head genug hat; mit pipefail wäre das sonst ein Abbruch
+  CODE=$(LC_ALL=C tr -dc 'A-HJ-NP-Z2-9' < /dev/urandom | head -c 8 || true)
+  [[ ${#CODE} -eq 8 ]] || { echo "Einrichtungs-Code liess sich nicht erzeugen." >&2; exit 1; }
   echo "${CODE:0:4}-${CODE:4:4}" > "$CODE_DATEI"
   chown "$USER_NAME":"$USER_NAME" "$CODE_DATEI"; chmod 600 "$CODE_DATEI"
 fi
@@ -166,6 +168,11 @@ systemctl enable solarmaa-dash >/dev/null
 systemctl restart solarmaa-dash
 sleep 3
 systemctl --no-pager --lines=5 status solarmaa-dash || true
+if [[ $IS_UPDATE -eq 0 ]]; then
+  # Eine Installation von Hand ersetzt einen unterbrochenen Paket-Umstieg: dessen Marke würde sonst beim
+  # nächsten Start den vorherigen Stand zurückholen. (Mit --update ruft solarmaa-update auf; es löscht selbst.)
+  sync; rm -f /var/lib/solarmaa-update/umschalten-laeuft
+fi
 
 IP=$(hostname -I | awk '{print $1}')
 echo

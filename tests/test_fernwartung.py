@@ -1006,8 +1006,10 @@ class StartUndUpdateTests(unittest.TestCase):
         """M-1 und E9: «wird gerade abgeregelt oder steht eine Freigabe aus?» über dieselbe Adresse."""
         import solarmaa_update as su
 
+        leer = tempfile.mkdtemp()                         # Datenordner ohne Zustandsdatei (nie den echten nehmen)
+
         def grund(toml):
-            return su.abregelung_grund(str(self._datei(toml)))
+            return su.abregelung_grund(str(self._datei(toml)), leer)
         aktiv = {"abregelung": {"aktiv": True, "modus": "auto"}}
         srv = self._attrappe("127.0.0.2", {"/api/now": aktiv})
         toml = f'[server]\nhost = "127.0.0.2"\nport = {srv.server_address[1]}\n'
@@ -1085,6 +1087,34 @@ class WartungUpdateTests(unittest.TestCase):
         self.assertIs(call("/api/now")[1]["abregelung"]["freigabe_offen"], False)
         self.assertEqual(call("/api/wartung/update", {}, ck)[0], 200)
         self.assertEqual(angefordert, ["admin"])
+
+    def test_simulation_hat_nichts_freizugeben(self):
+        """B3: Im Modus simulation ist letzte_w nur gerechnet; offen bleibt nur ein unbekannter Zustand."""
+        from solarmaa_dash.fernwartung import _freigabe_offen
+        wr = types.SimpleNamespace(letzte_w=30000.0, nenn_w=60000.0, fehler=None)
+        abr = types.SimpleNamespace(modus="simulation", unbekannt=False, wr=[wr])
+        self.assertFalse(_freigabe_offen(abr))
+        abr.unbekannt = True
+        self.assertTrue(_freigabe_offen(abr))
+        abr.unbekannt, abr.modus = False, "auto"
+        self.assertTrue(_freigabe_offen(abr))
+        # echter Ablauf: Simulation im Testfenster setzt letzte_w, /api/now meldet trotzdem nichts offen
+        from solarmaa_dash.abregelung import Abregelung
+        from solarmaa_dash.preise import Preise
+        from solarmaa_dash.sources import Snapshot
+        cfg = config._merge(config.DEFAULTS, {"abregelung": {
+            "modus": "simulation", "preisquelle": "keine", "wechselrichter": [
+                {"name": "WR1", "host": "127.0.0.1", "port": 1, "unit": 1, "nennleistung_w": 60000}]}})
+        t = time.time()
+        preise = Preise(cfg["abregelung"], None)
+        preise.daten = {int(t) - 60: (int(t) + 3600, -20.0)}
+        a = Abregelung(cfg, preise)
+        a.unbekannt = False
+        for i in range(5):
+            a.tick(Snapshot(t + i * 10, 50000.0, -40000.0, 10000.0), jetzt=t + i * 10)
+        self.assertTrue(a.aktiv)
+        self.assertTrue(any(w.letzte_w is not None and w.letzte_w < w.nenn_w for w in a.wr))
+        self.assertFalse(_freigabe_offen(a))
 
 
 class HochladenTests(unittest.TestCase):
