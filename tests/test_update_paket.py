@@ -1010,3 +1010,28 @@ class OhneGitTests(unittest.TestCase):
             befehle = "\n".join(z for z in (ROOT / "pi" / name).read_text().splitlines() if not z.lstrip().startswith("#"))
             self.assertNotRegex(befehle, r"\bgit\b", name)
             self.assertNotIn("raw.githubusercontent.com", befehle, name)
+
+
+@unittest.skipUnless((ROOT / "werkzeuge").is_dir(), "werkzeuge/ ist nicht im Paket für die Pis")
+class WerkzeugeTests(unittest.TestCase):
+    """werkzeuge/*.ps1 laufen nur unter Windows (hier nicht ausführbar). Geprüft wird nur, dass das Manifest,
+    das paket-signieren.ps1 schreibt, genau dem entspricht, was die Pis annehmen."""
+
+    def test_manifest_aus_paket_signieren(self):
+        import re
+        text = (ROOT / "werkzeuge/paket-signieren.ps1").read_text(encoding="utf-8-sig")
+        teil = text.split("$manifest = ", 1)[1].split("\n$mPfad", 1)[0]
+        stuecke = re.findall(r'"((?:[^"`]|`.)*)"', teil)
+        roh = "".join(stuecke).replace("`n", "\n").replace('`"', '"')
+        werte = {"$Kanal": "test", "$ver": "1.8.0", "$($a.commit)": COMMIT, "$erstellt": "17.11.2026 10:00",
+                 "$dateiname": "solarmaa-dash-1.8.0.tar.gz", "$groesse": "1234", "$sha": "a" * 64}
+        for k, v in werte.items():
+            roh = roh.replace(k, v)
+        self.assertNotIn("$", roh)
+        self.assertTrue(roh.endswith("}\n"))
+        m = su.manifest_lesen(roh.encode())
+        self.assertEqual((m["kanal"], m["version"], m["groesse"]), ("test", "1.8.0", 1234))
+        for name in ("paket-signieren.ps1", "schluessel-erzeugen.ps1"):      # Windows PowerShell 5.1 braucht das BOM für Umlaute
+            self.assertTrue((ROOT / "werkzeuge" / name).read_bytes().startswith(b"\xef\xbb\xbf"), name)
+        self.assertIn('-n solarmaa-update', text)
+        self.assertIn('"-t", "ed25519-sk"', (ROOT / "werkzeuge/schluessel-erzeugen.ps1").read_text(encoding="utf-8-sig"))
