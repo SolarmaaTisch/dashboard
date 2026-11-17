@@ -53,6 +53,20 @@ class Schluessel:
         return (d / "m.sig").read_bytes()
 
 
+_SCHLUESSEL: dict = {}
+
+
+def schluessel(name: str) -> "Schluessel":
+    """Wegwerf-Schlüssel, einmal pro Testlauf erzeugt (spart Zeit auf dem Pi) und am Ende gelöscht."""
+    if name not in _SCHLUESSEL:
+        if not _SCHLUESSEL:
+            ordner = Path(tempfile.mkdtemp(prefix="nur-test-schluessel."))
+            unittest.addModuleCleanup(shutil.rmtree, ordner, True)
+            _SCHLUESSEL["_ordner"] = ordner
+        _SCHLUESSEL[name] = Schluessel(_SCHLUESSEL["_ordner"], name)
+    return _SCHLUESSEL[name]
+
+
 def manifest(version="1.8.0", kanal="stabil", **anders) -> dict:
     m = {"format": 1, "paket": "solarmaa-dash", "kanal": kanal, "version": version, "commit": COMMIT,
          "erstellt": "17.11.2026 10:00", "datei": f"solarmaa-dash-{version}.tar.gz", "groesse": 1, "sha256": "0" * 64}
@@ -99,7 +113,7 @@ class FreigabeTests(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp(prefix="nur-test-schluessel."))
         self.addCleanup(shutil.rmtree, self.d, True)
-        self.haupt, self.ersatz, self.fremd = (Schluessel(self.d, n) for n in ("haupt", "ersatz", "fremd"))
+        self.haupt, self.ersatz, self.fremd = (schluessel(n) for n in ("haupt", "ersatz", "fremd"))
         self.erlaubt = self.d / "update-schluessel"
         self.erlaubt.write_text("# nur Test\n" + self.haupt.zeile() + self.ersatz.zeile())
 
@@ -342,7 +356,7 @@ def datei_server(test: unittest.TestCase, dateien: dict):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Datei)
     srv.daemon_threads = True
     srv.dateien, srv.abrufe = dateien, []
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     test.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
@@ -366,3 +380,352 @@ class LadenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(SSH_KEYGEN is None, "ssh-keygen fehlt: Ablauftests übersprungen (Paket openssh-client)")
+class AblaufTests(unittest.TestCase):
+    """Der ganze Lauf mit Attrappen: Pfade im Temp-Ordner, Tests/konfig-pruefen/install.sh/Dienst ersetzt."""
+
+    def setUp(self):
+        import contextlib
+        self.d = Path(tempfile.mkdtemp(prefix="nur-test-ablauf."))
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.haupt, self.fremd = schluessel("haupt"), schluessel("fremd")
+        etc, ziel = self.d / "etc", self.d / "opt"
+        for o in (etc, ziel / "pi/solarmaa_dash", ziel / "app", self.d / "dienst"):
+            o.mkdir(parents=True)
+        (etc / "update-schluessel").write_text(self.haupt.zeile())
+        (etc / "update-kanal").write_text("stabil\n")
+        (etc / "config.toml").write_text('[server]\nport = 1\n')
+        (ziel / "pi/solarmaa_dash/__init__.py").write_text('__version__ = "1.7.0"\n')
+        (ziel / "pi/install.sh").write_text("#!/bin/sh\n")
+        (ziel / "app/index.html").write_text("alt\n")
+        (self.d / "dienst/update-anfrage").write_text("admin\n")
+        self.p = su.Pfade(etc=str(etc), zustand=str(self.d / "zustand"), ziel=str(ziel),
+                          dienst_daten=str(self.d / "dienst"), ssh_keygen=SSH_KEYGEN)
+        os.makedirs(self.p.zustand, 0o700)
+        os.makedirs(self.p.releases)
+        self.dateien = {}
+        self.srv, url = datei_server(self, self.dateien)
+        (etc / "update-quelle").write_text(url + "/pi-pakete\n")
+        self.u = self._updater()
+        self.ausgabe = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.ausgabe))
+
+    def _updater(self):
+        test = self
+
+        class U(su.Updater):
+            nur_https = False
+            tests_ok, konfig_fehler, install_ok, dienst_ok = True, None, [True], True
+            gruende = []
+            aufrufe = []
+
+            def abregelung_grund(self):
+                return self.gruende.pop(0) if self.gruende else None
+
+            def tests_laufen(self, release):
+                self.aufrufe.append(("tests", os.path.basename(release)))
+                return self.tests_ok
+
+            def konfig_pruefen(self, release):
+                self.aufrufe.append(("konfig", os.path.basename(release)))
+                return self.konfig_fehler
+
+            def installieren(self, release, ohne_neustart=False):
+                self.aufrufe.append(("install", os.path.basename(release), ohne_neustart))
+                test.assertTrue(os.path.exists(self.p.marke), "Marke muss vor install.sh stehen")
+                ok = self.install_ok.pop(0) if len(self.install_ok) > 1 else self.install_ok[0]
+                if ok:   # wie install.sh: Programm nach /opt kopieren
+                    for teil in ("pi", "app"):
+                        shutil.rmtree(os.path.join(self.p.ziel, teil), True)
+                        shutil.copytree(os.path.join(release, teil), os.path.join(self.p.ziel, teil))
+                return ok
+
+            def dienst_antwortet(self):
+                return self.dienst_ok
+
+        return U(self.p)
+
+    def veroeffentlichen(self, version="1.8.0", kanal="stabil", schluessel=None, paket=None, **anders):
+        paket = paket if paket is not None else paket_bauen(version)
+        m = manifest(version, kanal, groesse=len(paket), sha256=hashlib.sha256(paket).hexdigest())
+        m.update(anders)
+        mb = manifest_bytes(m)
+        self.dateien[f"/pi-pakete/{kanal}/freigabe.txt"] = mb + (schluessel or self.haupt).signieren(mb)
+        self.dateien[f"/pi-pakete/{kanal}/solarmaa-dash-{version}.tar.gz"] = paket
+        return m
+
+    def lauf(self, erzwingen=False) -> int:
+        self.srv.abrufe.clear()
+        return self.u.aktualisieren(erzwingen)
+
+    def installiert(self):
+        return su._json_lesen(self.p.installiert)
+
+    def releases(self):
+        return sorted(os.listdir(self.p.releases))
+
+    def ergebnis(self):
+        from solarmaa_dash import config, wartung
+        from unittest import mock
+        log = self.d / "update.log"
+        log.write_text(self.ausgabe.getvalue(), encoding="utf-8")
+        with mock.patch.object(wartung, "UPDATE_LOG", log):
+            return wartung.Wartung(config.load(None), log.parent).update_ergebnis(0)
+
+    def test_erfolg_und_zweites_update(self):
+        self.veroeffentlichen("1.8.0")
+        self.assertEqual(self.lauf(), 0, self.ausgabe.getvalue())
+        self.assertFalse(os.path.exists(self.p.anfrage))
+        self.assertEqual(self.u.aufrufe, [("tests", "1.8.0"), ("konfig", "1.8.0"), ("install", "1.8.0", False)])
+        inst = self.installiert()
+        self.assertEqual((inst["version"], inst["release"], inst["vorher"], inst["kanal"], inst["commit"]),
+                         ("1.8.0", "1.8.0", "vorher-1.7.0", "stabil", COMMIT))
+        self.assertEqual(os.stat(self.p.installiert).st_mode & 0o777, 0o600)
+        anzeige = json.loads(Path(self.p.paket_json).read_text())
+        self.assertEqual((anzeige["version"], anzeige["kanal"], anzeige["commit"]), ("1.8.0", "stabil", COMMIT))
+        self.assertNotIn("sha256", anzeige)
+        self.assertEqual(os.stat(self.p.paket_json).st_mode & 0o777, 0o644)
+        self.assertFalse(os.path.exists(self.p.marke))
+        self.assertEqual(self.releases(), ["1.8.0", "vorher-1.7.0"])
+        self.assertEqual(Path(self.p.releases, "vorher-1.7.0/app/index.html").read_text(), "alt\n")
+        self.assertEqual(self.ergebnis(), (True, f"OK: 1.7.0 → 1.8.0 installiert (Kanal stabil, Commit {COMMIT[:7]})."))
+        self.assertFalse(os.path.exists(os.path.join(self.p.zustand, "paket.tmp")))
+        # nochmals: bereits aktuell, nur die Freigabe wird geladen
+        self.assertEqual(self.lauf(), 0)
+        self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
+        self.assertTrue(self.ausgabe.getvalue().rstrip().endswith("Bereits aktuell (1.8.0)."))
+        # nächste Version: höchstens zwei Stände bleiben
+        self.u.aufrufe.clear()
+        self.veroeffentlichen("1.9.0")
+        self.assertEqual(self.lauf(), 0, self.ausgabe.getvalue())
+        self.assertEqual(self.releases(), ["1.8.0", "1.9.0"])
+        self.assertEqual((self.installiert()["version"], self.installiert()["vorher"]), ("1.9.0", "1.8.0"))
+
+    def test_aeltere_freigabe_wird_nicht_installiert(self):
+        self.veroeffentlichen("1.6.9")
+        self.assertEqual(self.lauf(), 0)
+        self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
+        self.assertIn("freigegeben ist die ältere 1.6.9, sie wird nicht installiert", self.ausgabe.getvalue())
+        self.assertIsNone(self.installiert())
+        self.assertEqual(self.u.aufrufe, [])
+        self.veroeffentlichen("1.7.0")
+        self.assertEqual(self.lauf(), 0)
+        self.assertEqual(self.ergebnis(), (True, "Bereits aktuell (1.7.0)."))
+
+    def test_ungueltige_freigabe_laedt_kein_paket(self):
+        for schluessel, kanal in ((self.fremd, "stabil"), (self.haupt, "test")):
+            self.dateien.clear()
+            self.veroeffentlichen("1.8.0", kanal=kanal, schluessel=schluessel)
+            if kanal == "test":    # Freigabe für «test» unter dem Pfad von «stabil» abgelegt
+                self.dateien["/pi-pakete/stabil/freigabe.txt"] = self.dateien.pop("/pi-pakete/test/freigabe.txt")
+            with self.subTest(kanal=kanal):
+                self.assertEqual(self.lauf(), 1)
+                self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
+                self.assertEqual(self.releases(), [])
+                self.assertEqual(self.u.aufrufe, [])
+                self.assertFalse(self.ergebnis()[0])
+        self.assertIn("FEHLER: Signatur der Freigabe ungültig", self.ausgabe.getvalue())
+        self.assertIn("FEHLER: Freigabe gilt für Kanal test, dieser Pi ist auf Kanal stabil", self.ausgabe.getvalue())
+
+    def test_paket_passt_nicht(self):
+        echt = paket_bauen("1.8.0")
+        for name, paket in (("kürzer", echt[:-10]), ("länger", echt + b"x"), ("anders", echt[:-1] + bytes([echt[-1] ^ 1]))):
+            with self.subTest(name):
+                m = self.veroeffentlichen("1.8.0")
+                self.dateien["/pi-pakete/stabil/solarmaa-dash-1.8.0.tar.gz"] = paket
+                self.assertEqual(self.lauf(), 1)
+                self.assertRegex(self.ausgabe.getvalue(), "FEHLER: (Paket passt nicht zur Freigabe|Datei grösser als erwartet)")
+                self.assertEqual(self.releases(), [])
+                self.assertEqual(self.u.aufrufe, [])
+                self.assertEqual(m["groesse"], len(echt))
+        self.dateien["/pi-pakete/stabil/solarmaa-dash-1.8.0.tar.gz"] = (echt[:100], len(echt))   # Download bricht ab
+        self.assertEqual(self.lauf(), 1)
+        self.assertIn("abgebrochen", self.ausgabe.getvalue().splitlines()[-1])
+        self.assertEqual(self.releases(), [])
+
+    def test_freigabe_zu_gross(self):
+        self.veroeffentlichen("1.8.0")
+        f = self.dateien["/pi-pakete/stabil/freigabe.txt"]
+        self.dateien["/pi-pakete/stabil/freigabe.txt"] = b" " * (su.MAX_FREIGABE - len(f) + 1) + f
+        self.assertEqual(self.lauf(), 1)
+        self.assertIn("grösser als erwartet", self.ausgabe.getvalue())
+
+    def test_boeses_paket_wird_nicht_entpackt(self):
+        def link(tar, praefix):
+            ti = tarfile.TarInfo(f"{praefix}/pi/x")
+            ti.type, ti.linkname = tarfile.SYMTYPE, "/etc"
+            tar.addfile(ti)
+        self.veroeffentlichen("1.8.0", paket=paket_bauen("1.8.0", extra=[link]))
+        self.assertEqual(self.lauf(), 1)
+        self.assertIn("Link oder eine Sonderdatei", self.ausgabe.getvalue())
+        self.assertEqual(self.releases(), [])
+        self.assertEqual(self.u.aufrufe, [])
+
+    def _unveraendert(self):
+        self.assertIsNone(self.installiert())
+        self.assertFalse(os.path.exists(self.p.marke))
+        self.assertEqual(Path(self.p.ziel, "pi/solarmaa_dash/__init__.py").read_text(), '__version__ = "1.7.0"\n')
+        self.assertFalse(self.ergebnis()[0])
+
+    def test_tests_oder_konfiguration_scheitern(self):
+        self.veroeffentlichen("1.8.0")
+        self.u.tests_ok = False
+        self.assertEqual(self.lauf(), 1)
+        self.assertEqual(self.u.aufrufe, [("tests", "1.8.0")])
+        self.assertIn("FEHLER: Tests von 1.8.0 fehlgeschlagen", self.ausgabe.getvalue())
+        self.assertEqual(self.releases(), [])
+        self._unveraendert()
+        self.u.tests_ok, self.u.konfig_fehler = True, "smartme.basis_url muss mit https:// beginnen"
+        self.u.aufrufe.clear()
+        self.assertEqual(self.lauf(), 1)
+        self.assertEqual([a[0] for a in self.u.aufrufe], ["tests", "konfig"])
+        self.assertIn("FEHLER: Konfiguration passt nicht zur neuen Version: smartme.basis_url", self.ausgabe.getvalue())
+        self._unveraendert()
+
+    def test_installation_oder_dienst_scheitert_zurueck(self):
+        self.veroeffentlichen("1.8.0")
+        for install_ok, dienst_ok in (([False, True], True), ([True], False)):
+            with self.subTest(install=install_ok, dienst=dienst_ok):
+                self.u.aufrufe.clear()
+                self.u.install_ok, self.u.dienst_ok = install_ok, dienst_ok
+                self.assertEqual(self.lauf(), 1)
+                self.assertEqual([a for a in self.u.aufrufe if a[0] == "install"],
+                                 [("install", "1.8.0", False), ("install", "vorher-1.7.0", False)])
+                self.assertIn("zurück auf 1.7.0", self.ausgabe.getvalue())
+                self.assertIn("Alte Version vorher-1.7.0 wiederhergestellt.", self.ausgabe.getvalue())
+                self.assertEqual(self.releases(), ["vorher-1.7.0"])
+                self._unveraendert()
+
+    def test_stromausfall_beim_umschalten_und_wiederherstellung(self):
+        self.veroeffentlichen("1.8.0")
+        self.u.install_ok = [False, False]           # neu scheitert, Rückweg scheitert auch
+        self.assertEqual(self.lauf(), 1)
+        self.assertTrue(os.path.exists(self.p.marke))
+        self.assertIn("FEHLER: Wiederherstellung von vorher-1.7.0 fehlgeschlagen", self.ausgabe.getvalue())
+        # Systemstart: solarmaa-update --wiederherstellen (ohne Neustart des Dienstes)
+        self.u.install_ok, self.u.aufrufe = [True], []
+        self.assertEqual(self.u.wiederherstellen(ohne_neustart=True), 0)
+        self.assertEqual(self.u.aufrufe, [("install", "vorher-1.7.0", True)])
+        self.assertFalse(os.path.exists(self.p.marke))
+        # Marke steht noch beim nächsten Lauf: zuerst zurück, dann normal weiter
+        su._schreiben(self.p.marke, json.dumps({"ziel": "1.8.0", "zurueck": "vorher-1.7.0"}).encode(), 0o600)
+        self.u.aufrufe = []
+        self.assertEqual(self.lauf(), 0, self.ausgabe.getvalue())
+        self.assertEqual([a[1] for a in self.u.aufrufe if a[0] == "install"], ["vorher-1.7.0", "1.8.0"])
+        self.assertEqual(self.installiert()["version"], "1.8.0")
+        # Marke mit Pfad nach draussen: nichts ausführen
+        su._schreiben(self.p.marke, json.dumps({"zurueck": "../../tmp/x"}).encode(), 0o600)
+        self.u.aufrufe = []
+        self.assertEqual(self.u.wiederherstellen(True), 1)
+        self.assertEqual(self.u.aufrufe, [])
+
+    def test_wiederherstellen_beim_start(self):
+        from unittest import mock
+        with mock.patch.object(su, "Pfade", return_value=self.p), mock.patch.object(su, "Updater", lambda p: self.u):
+            self.assertEqual(su.main(["--wiederherstellen"]), 0)      # keine Marke: nichts
+            self.assertEqual(self.ausgabe.getvalue(), "")
+            os.makedirs(os.path.join(self.p.releases, "vorher-1.7.0", "pi"))
+            os.makedirs(os.path.join(self.p.releases, "vorher-1.7.0", "app"))
+            Path(self.p.releases, "vorher-1.7.0", "pi", "install.sh").write_text("")
+            su._schreiben(self.p.marke, json.dumps({"ziel": "1.8.0", "zurueck": "vorher-1.7.0"}).encode(), 0o600)
+            self.assertEqual(su.main(["--wiederherstellen"]), 0)
+        self.assertEqual(self.u.aufrufe, [("install", "vorher-1.7.0", True)])
+        self.assertFalse(os.path.exists(self.p.marke))
+        # das unterbrochene Update gilt als fehlgeschlagen
+        self.ausgabe.seek(0)
+        text = self.ausgabe.getvalue()
+        self.ausgabe.truncate(0)
+        self.ausgabe.write("=== Update 01.01.2030 00:00:00, Kanal stabil ===\n" + text)
+        ok, zeile = self.ergebnis()
+        self.assertFalse(ok)
+        self.assertIn("beim Umschalten unterbrochen", zeile)
+
+    def test_abregelung_verschiebt(self):
+        self.veroeffentlichen("1.8.0")
+        for gruende, geladen in ((["Anlage wird gerade abgeregelt"], False),
+                                 ([None, "Freigabe eines Wechselrichters steht noch aus"], True)):
+            with self.subTest(gruende=gruende):
+                self.u.gruende, self.u.aufrufe = list(gruende), []
+                self.assertEqual(self.lauf(), 0)
+                self.assertEqual(self.ausgabe.getvalue().splitlines()[-1],
+                                 f"Verschoben: {gruende[-1]}. Später erneut starten (oder: sudo solarmaa-update --erzwingen).")
+                self.assertEqual(bool(self.srv.abrufe), geladen)
+                self.assertNotIn("install", [a[0] for a in self.u.aufrufe])
+                self.assertEqual(self.releases(), [])
+                self.assertFalse(os.path.exists(self.p.marke))
+                ok, zeile = self.ergebnis()
+                self.assertFalse(ok)
+                self.assertTrue(zeile.startswith("Verschoben"))
+        self.u.gruende = ["Anlage wird gerade abgeregelt"] * 2
+        self.assertEqual(self.lauf(erzwingen=True), 0)
+        self.assertEqual(self.u.gruende, ["Anlage wird gerade abgeregelt"] * 2)      # nicht gefragt
+        self.assertEqual(self.installiert()["version"], "1.8.0")
+
+    def test_kanal_und_quelle_nur_aus_den_root_dateien(self):
+        Path(self.p.config).write_text('[server]\nport = 1\n[update]\nkanal = "test"\nquelle = "http://boese.example"\n')
+        self.veroeffentlichen("1.8.0", kanal="test")
+        self.assertEqual(self.lauf(), 1)                       # Pi bleibt auf «stabil»: dort liegt nichts
+        self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
+        os.unlink(self.p.kanal)
+        self.assertEqual(self.lauf(), 1)
+        self.assertIn("FEHLER: Update-Kanal fehlt oder ist ungültig", self.ausgabe.getvalue())
+        Path(self.p.kanal).write_text("stabil\n")
+        os.unlink(self.p.quelle)
+        self.assertEqual(self.lauf(), 1)
+        self.assertIn("FEHLER: Update-Quelle fehlt oder ist ungültig", self.ausgabe.getvalue())
+        Path(self.p.quelle).write_text("http://127.0.0.1:1/x\n")
+        self.u.nur_https = True
+        self.assertEqual(self.lauf(), 1)
+        self.assertEqual(self.ausgabe.getvalue().count("FEHLER: Update-Quelle fehlt oder ist ungültig"), 2)
+
+    def test_pruefung_nur_mit_installiertem_schluessel(self):
+        """Nie eine Datei aus dem neuen Paket für die Prüfung: Das Paket bringt eigene Schlüssel und ein eigenes
+        solarmaa_update.py mit; geprüft wird trotzdem nur mit der installierten Schlüsseldatei, und vor der
+        Prüfung liegt nichts vom Paket auf der Platte."""
+        from unittest import mock
+
+        def eigene(tar, praefix):
+            for name, inhalt in (("pi/update-schluessel/allowed_signers", self.fremd.zeile().encode()),
+                                 ("pi/solarmaa_update.py.boese", b"raise SystemExit('nie')\n")):
+                ti = tarfile.TarInfo(f"{praefix}/{name}")
+                ti.size = len(inhalt)
+                tar.addfile(ti, io.BytesIO(inhalt))
+        self.veroeffentlichen("1.8.0", paket=paket_bauen("1.8.0", extra=[eigene]), schluessel=self.fremd)
+        echt = subprocess.run
+        aufrufe = []
+
+        def spion(args, *a, **k):
+            aufrufe.append(list(args))
+            return echt(args, *a, **k)
+        with mock.patch.object(su.subprocess, "run", spion):
+            self.assertEqual(self.lauf(), 1)
+        self.assertEqual(len(aufrufe), 1)
+        self.assertEqual(aufrufe[0][:2], [SSH_KEYGEN, "-Y"])
+        self.assertEqual(aufrufe[0][aufrufe[0].index("-f") + 1], self.p.schluessel)
+        self.assertEqual(self.releases(), [])
+        self.assertEqual(self.srv.abrufe, ["/pi-pakete/stabil/freigabe.txt"])
+
+    def test_erstinstallation(self):
+        from unittest import mock
+        m = self.veroeffentlichen("1.8.0")
+        f, p = self.d / "freigabe.txt", self.d / "paket.tar.gz"
+        f.write_bytes(self.dateien["/pi-pakete/stabil/freigabe.txt"])
+        p.write_bytes(self.dateien["/pi-pakete/stabil/solarmaa-dash-1.8.0.tar.gz"])
+        aufrufe, echt = [], subprocess.run
+
+        def install_attrappe(args, **k):
+            if args[0] == SSH_KEYGEN:
+                return echt(args, **k)
+            aufrufe.append(args)
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch.object(su.subprocess, "run", install_attrappe):
+            self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "test", []), 1)   # falscher Kanal
+            self.assertEqual(aufrufe, [])
+            self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "stabil", ["--hostname", "x"]), 0)
+        self.assertEqual(aufrufe, [[os.path.join(self.p.releases, "1.8.0", "pi", "install.sh"), "--kanal", "stabil", "--hostname", "x"]])
+        self.assertEqual(self.installiert()["sha256"], m["sha256"])
+        p.write_bytes(p.read_bytes() + b"x")
+        self.assertEqual(self.u.erstinstallation(str(f), str(p), self.p.schluessel, "stabil", []), 1)
+        self.assertIn("FEHLER: Paket passt nicht zur Freigabe", self.ausgabe.getvalue())

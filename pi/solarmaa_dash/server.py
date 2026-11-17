@@ -11,7 +11,7 @@ Mit Login (Cookie sm_sitzung)
   POST /api/rechnungen/status {nr, status}    nur admin/verwaltung
   GET  /api/benutzer                          nur admin/verwaltung
   GET  /api/wartung                           nur admin: Version, Update-Protokoll, Geräte, Erkennung
-  POST /api/wartung/update                    nur admin: Update aus dem Repository anstossen
+  POST /api/wartung/update                    nur admin: Update (signiertes Paket) anstossen
   POST /api/wartung/erkennen                  nur admin: Geräte im Netz suchen
 
 POST-Anfragen brauchen den Header ``X-Solarmaa: 1`` (Schutz gegen fremde Webseiten).
@@ -94,8 +94,11 @@ class State:
     def abregelung_kurz(self) -> dict | None:
         if self.abregelung is None:
             return None
+        from .fernwartung import _freigabe_offen
         st = self.abregelung.status()
-        return {k: st[k] for k in ("modus", "aktiv", "grund", "preis", "naechster_negativ")}
+        # freigabe_offen: ein Wechselrichter könnte noch begrenzt sein (solarmaa-update verschiebt dann)
+        return {**{k: st[k] for k in ("modus", "aktiv", "grund", "preis", "naechster_negativ")},
+                "freigabe_offen": _freigabe_offen(self.abregelung)}
 
     def geraete_status(self) -> list[dict]:
         if self.source is None or not hasattr(self.source, "geraete"):
@@ -395,6 +398,9 @@ def make_handler(state: State, app_dir: Path):
                     u = self._admin()
                     if state.abregelung and state.abregelung.aktiv:
                         raise HttpFehler(409, "Gerade wird abgeregelt. Update bitte nach dem negativen Preisfenster starten.")
+                    from .fernwartung import _freigabe_offen
+                    if state.abregelung and _freigabe_offen(state.abregelung):
+                        raise HttpFehler(409, "Die Freigabe eines Wechselrichters steht noch aus. Update bitte später starten.")
                     state.wartung.update_anfordern(u["name"])
                     return self._json({"ok": True, "hinweis": "Update gestartet. Der Dienst startet danach neu."})
                 if url.path == "/api/wartung/alarmtest":

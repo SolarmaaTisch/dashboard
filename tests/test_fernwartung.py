@@ -950,36 +950,28 @@ class StartUndUpdateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(text.startswith("FEHLER: Konfiguration passt nicht"))
 
-    def test_update_sh_prueft_vor_dem_umschalten(self):
-        """update.sh selbst braucht root und feste Pfade (/opt, /etc, /var/log); geprüft wird hier, dass die
-        Prüfung vor install.sh steht, bei Fehler zurückschaltet, und dass ihre Meldung als Fehler zählt."""
+    def test_update_sh_ist_nur_huelle(self):
+        """update.sh selbst braucht root und feste Pfade (/opt, /etc, /var/log). Es ruft nur das installierte
+        solarmaa_update.py isoliert auf und schreibt ins Protokoll; kein git, kein Code aus einem neuen Stand.
+        Die Reihenfolge Tests -> konfig-pruefen -> install.sh prüft tests/test_update_paket.py."""
         skript = (self.PI / "update.sh").read_text(encoding="utf-8")
-        pruef, install = skript.index("konfig-pruefen -c /etc/solarmaa-dash/config.toml"), skript.index('if "$SRC/pi/install.sh" --update')
-        self.assertLess(skript.index("unittest discover"), pruef)
-        self.assertLess(pruef, install)
-        zweig = skript[pruef:install]
-        self.assertIn('echo "FEHLER: Konfiguration passt nicht zur neuen Version:', zweig)
-        self.assertIn('checkout --quiet --force "$ALT"; exit 1', zweig)
-        self.assertIn('install.sh" --update && dienst_antwortet; then', skript)
-        zeile = skript[skript.rindex("\n", 0, pruef):pruef]
-        self.assertIn("runuser -u solarmaa-dash", zeile)                         # als Dienstbenutzer, nicht als root
+        self.assertIn('python3 -I /usr/local/lib/solarmaa-update/solarmaa_update.py "$@"', skript)
+        self.assertIn('} >> "$LOG" 2>&1', skript)
+        befehle = "\n".join(z for z in skript.splitlines() if not z.lstrip().startswith("#"))
+        self.assertNotIn("git", befehle)
+        self.assertNotIn("install.sh", befehle)
+        updater = (self.PI / "solarmaa_update.py").read_text(encoding="utf-8")
+        self.assertNotIn("solarmaa_dash import", updater)
+        self.assertNotIn("import solarmaa_dash", updater)
+        self.assertIn('"runuser", "-u", "solarmaa-dash"', updater)      # Tests und Prüfung ohne Root-Rechte
         log = Path(tempfile.mkdtemp()) / "update.log"
-        log.write_text(f"=== Update {time.strftime('%d.%m.%Y %H:%M:%S')}, Branch stabil ===\n"
+        log.write_text(f"=== Update {time.strftime('%d.%m.%Y %H:%M:%S')}, Kanal stabil ===\n"
                        "FEHLER: Konfiguration passt nicht zur neuen Version: smartme.basis_url muss mit https:// beginnen. "
-                       "Alte Version abc1234 bleibt.\n")
+                       "Alte Version 1.7.0 bleibt.\n")
         with mock.patch.object(wartung, "UPDATE_LOG", log):
             ok, text = wartung.Wartung(config.load(None), log.parent).update_ergebnis(time.time() - 60)
         self.assertFalse(ok)
         self.assertIn("passt nicht zur neuen Version", text)
-
-    def _update_sh_python(self, kennung: str) -> str:
-        """Ein eingebetteter Python-Teil aus update.sh, mit Konfigurationspfad auf eine Testdatei umgebogen."""
-        import re
-        skript = (self.PI / "update.sh").read_text(encoding="utf-8")
-        teile = re.findall(r"python3 - <<'PY'\n(.*?)\nPY\n", skript, re.S)
-        teil = next(t for t in teile if kennung in t)
-        self.assertEqual(teil.count('open("/etc/solarmaa-dash/config.toml", "rb")'), 1)
-        return teil.replace("time.sleep(2)", "time.sleep(0.05)")
 
     def _attrappe(self, host: str, routes: dict):
         from test_erweiterung import FakeHttpHandler
@@ -988,41 +980,111 @@ class StartUndUpdateTests(unittest.TestCase):
         srv = ThreadingHTTPServer((host, 0), FakeHttpHandler)
         srv.daemon_threads = True
         srv.routes, srv.need_key, srv.posts, srv.gets = routes, None, [], 0
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
         return srv
 
-    def _lauf(self, teil: str, server_toml: str) -> int:
-        import subprocess
-        pfad = self._datei(server_toml)
-        return subprocess.run([sys.executable, "-c", teil.replace("/etc/solarmaa-dash/config.toml", str(pfad))],
-                              timeout=120).returncode
-
-    def test_dienst_antwortet_im_update_sh(self):
+    def test_dienst_antwortet(self):
         """M-1: dienst_antwortet() fragt die Adresse ab, an die der Dienst bindet (server.host)."""
-        teil = self._update_sh_python("/api/health")
+        import solarmaa_update as su
+
+        def lauf(toml):
+            return su.dienst_antwortet(str(self._datei(toml)), versuche=3, pause=0.05)
         srv = self._attrappe("127.0.0.2", {"/api/health": {"status": "ok"}})
         port = srv.server_address[1]
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "127.0.0.2"\nport = {port}\n'), 0)   # gebunden an 127.0.0.2
+        self.assertTrue(lauf(f'[server]\nhost = "127.0.0.2"\nport = {port}\n'))           # gebunden an 127.0.0.2
         srv.routes.clear()
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "127.0.0.2"\nport = {port}\n'), 0)   # 404/503 = läuft
+        self.assertTrue(lauf(f'[server]\nhost = "127.0.0.2"\nport = {port}\n'))           # 404/503 = läuft
         lokal = self._attrappe("127.0.0.1", {"/api/health": {"status": "ok"}})
         for host in ("", "0.0.0.0", "::"):
-            self.assertEqual(self._lauf(teil, f'[server]\nhost = "{host}"\nport = {lokal.server_address[1]}\n'), 0, host)
-        self.assertEqual(self._lauf(teil, f'[server]\nport = {lokal.server_address[1]}\n'), 0)
+            self.assertTrue(lauf(f'[server]\nhost = "{host}"\nport = {lokal.server_address[1]}\n'), host)
+        self.assertTrue(lauf(f'[server]\nport = {lokal.server_address[1]}\n'))
         frei = self._attrappe("127.0.0.3", {}).server_address[1]
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "127.0.0.2"\nport = {frei}\n'), 1)     # niemand da
+        self.assertFalse(lauf(f'[server]\nhost = "127.0.0.2"\nport = {frei}\n'))           # niemand da
 
-    def test_abregelungsabfrage_im_update_sh(self):
-        """M-1: Die Abfrage «wird gerade abgeregelt?» vor dem Update nimmt dieselbe Adresse."""
-        teil = self._update_sh_python("/api/now")
+    def test_abregelungsabfrage(self):
+        """M-1 und E9: «wird gerade abgeregelt oder steht eine Freigabe aus?» über dieselbe Adresse."""
+        import solarmaa_update as su
+
+        def grund(toml):
+            return su.abregelung_grund(str(self._datei(toml)))
         aktiv = {"abregelung": {"aktiv": True, "modus": "auto"}}
         srv = self._attrappe("127.0.0.2", {"/api/now": aktiv})
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "127.0.0.2"\nport = {srv.server_address[1]}\n'), 0)   # verschieben
+        toml = f'[server]\nhost = "127.0.0.2"\nport = {srv.server_address[1]}\n'
+        self.assertEqual(grund(toml), "Anlage wird gerade abgeregelt")
         srv.routes["/api/now"] = {"abregelung": {"aktiv": False, "modus": "auto"}}
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "127.0.0.2"\nport = {srv.server_address[1]}\n'), 1)
+        self.assertIsNone(grund(toml))
+        srv.routes["/api/now"] = {"abregelung": {"aktiv": True, "modus": "simulation"}}
+        self.assertIsNone(grund(toml))
+        srv.routes["/api/now"] = {"abregelung": {"aktiv": False, "modus": "auto", "freigabe_offen": True}}
+        self.assertEqual(grund(toml), "Freigabe eines Wechselrichters steht noch aus")
+        srv.routes["/api/now"] = {"abregelung": None}
+        self.assertIsNone(grund(toml))
+        srv.routes.clear()                                                                   # 404: wie nicht erreichbar
+        self.assertIsNone(grund(toml))
         lokal = self._attrappe("127.0.0.1", {"/api/now": aktiv})
-        self.assertEqual(self._lauf(teil, f'[server]\nhost = "0.0.0.0"\nport = {lokal.server_address[1]}\n'), 0)
+        self.assertEqual(grund(f'[server]\nhost = "0.0.0.0"\nport = {lokal.server_address[1]}\n'), "Anlage wird gerade abgeregelt")
+        self.assertIsNone(grund('[server]\nhost = "127.0.0.4"\nport = 1\n'))           # nicht erreichbar: Update darf laufen
+
+
+class WartungUpdateTests(unittest.TestCase):
+    """E9: Update startet nicht, solange abgeregelt wird oder die Freigabe eines Wechselrichters aussteht.
+    /api/now meldet freigabe_offen, damit solarmaa-update dieselbe Regel anwenden kann."""
+
+    def test_lokales_update_wartet_auf_freigabe(self):
+        import json as _json
+        import socket
+        import urllib.error
+        import urllib.request
+        from solarmaa_dash.auth import Auth
+        from solarmaa_dash.server import serve
+        cfg = config.load(None)
+        store = Store(":memory:")
+        auth = Auth(store)
+        auth.anlegen("admin", "lang-genug-123", "admin")
+        angefordert = []
+        w = types.SimpleNamespace(update_anfordern=lambda von: angefordert.append(von))
+        state = State(cfg, store, "demo", None, None, auth, None, w)
+        state.publish(DemoSource().read())
+        wr = types.SimpleNamespace(letzte_w=60000.0, nenn_w=60000.0, fehler=None)
+        abr = types.SimpleNamespace(aktiv=False, unbekannt=True, wr=[wr], status=lambda: {
+            "modus": "auto", "aktiv": abr.aktiv, "grund": "", "preis": None, "naechster_negativ": None})
+        state.abregelung = abr
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        httpd = serve(state, Path(__file__).resolve().parent.parent / "app", "127.0.0.1", port)
+        self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close()))
+        basis_url = f"http://127.0.0.1:{port}"
+
+        def call(pfad, body=None, cookie=None):
+            req = urllib.request.Request(basis_url + pfad, data=None if body is None else _json.dumps(body).encode(),
+                                         method="GET" if body is None else "POST")
+            if body is not None:
+                req.add_header("X-Solarmaa", "1")
+            if cookie:
+                req.add_header("Cookie", cookie)
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, _json.loads(r.read()), r.headers.get("Set-Cookie")
+            except urllib.error.HTTPError as e:
+                return e.code, _json.loads(e.read()), None
+
+        _, _, ck = call("/api/login", {"benutzer": "admin", "passwort": "lang-genug-123"})
+        ck = ck.split(";")[0]
+        self.assertIs(call("/api/now")[1]["abregelung"]["freigabe_offen"], True)          # Zustand nach Start unbekannt
+        st, d, _ = call("/api/wartung/update", {}, ck)
+        self.assertEqual(st, 409)
+        self.assertIn("Freigabe eines Wechselrichters", d.get("fehler", str(d)))
+        abr.unbekannt, wr.letzte_w = False, 30000.0                                         # noch begrenzt
+        self.assertEqual(call("/api/wartung/update", {}, ck)[0], 409)
+        abr.aktiv = True
+        self.assertEqual(call("/api/wartung/update", {}, ck)[0], 409)
+        self.assertEqual(angefordert, [])
+        abr.aktiv, wr.letzte_w = False, 60000.0
+        self.assertIs(call("/api/now")[1]["abregelung"]["freigabe_offen"], False)
+        self.assertEqual(call("/api/wartung/update", {}, ck)[0], 200)
+        self.assertEqual(angefordert, ["admin"])
 
 
 class HochladenTests(unittest.TestCase):
