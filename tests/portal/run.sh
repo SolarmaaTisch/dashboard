@@ -128,9 +128,12 @@ schritt "Testhilfen" sqldatei neu "$HIER/hilfen.sql"
 schritt "Stufe 1: Zugriffsregeln" sqldatei neu "$HIER/test_stufe1.sql"
 schritt "Stufe 3: Fernwartung" sqldatei neu "$HIER/test_stufe3.sql"
 schritt "Anlagedoku" sqldatei neu "$HIER/test_dokumente.sql"
+schritt "Update-Pakete" sqldatei neu "$HIER/test_pakete.sql"
 schritt "Bucket wie im Dashboard verstellen (öffentlich, ohne Grenzen)" psql -X -q -v ON_ERROR_STOP=1 -d neu -c "update storage.buckets set public = true, file_size_limit = null, allowed_mime_types = null where id = 'anlagedoku'"
+schritt "Bucket pi-pakete verstellen (privat, andere Grenzen)" psql -X -q -v ON_ERROR_STOP=1 -d neu -c "update storage.buckets set public = false, file_size_limit = 1, allowed_mime_types = array['text/plain'] where id = 'pi-pakete'"
 schritt "schema.sql nach den Tests nochmals" sqldatei neu "$SCHEMA"
 schritt "Anlagedoku: Bucket wieder privat, Regeln vollständig" sqldatei neu "$HIER/dokumente_nach.sql"
+schritt "Update-Pakete: Bucket wieder öffentlich, Regeln vollständig" sqldatei neu "$HIER/test_pakete.sql"
 
 # ---------------------------------------------------------------- 2. Upgrade von Stufe 1
 echo "==> Bestehende Datenbank (Stufe 1) hochziehen"
@@ -141,6 +144,7 @@ schritt "Testhilfen" sqldatei upgrade "$HIER/hilfen.sql"
 schritt "Bestand erhalten, Fernwartung aus" sqldatei upgrade "$HIER/upgrade_nach.sql"
 schritt "Stufe 3: Fernwartung" sqldatei upgrade "$HIER/test_stufe3.sql"
 schritt "Anlagedoku" sqldatei upgrade "$HIER/test_dokumente.sql"
+schritt "Update-Pakete" sqldatei upgrade "$HIER/test_pakete.sql"
 
 # ---------------------------------------------------------------- 2b. Upgrade vom eingespielten Stand (Stufe 3)
 echo "==> Eingespielte Datenbank (Stufe 3) hochziehen"
@@ -153,6 +157,7 @@ schritt "Bestand erhalten" sqldatei upgrade3 "$HIER/upgrade_nach.sql"
 schritt "Anlagedoku: Bucket und Regeln vorhanden" sqldatei upgrade3 "$HIER/dokumente_nach.sql"
 schritt "Stufe 3: Fernwartung" sqldatei upgrade3 "$HIER/test_stufe3.sql"
 schritt "Anlagedoku" sqldatei upgrade3 "$HIER/test_dokumente.sql"
+schritt "Update-Pakete" sqldatei upgrade3 "$HIER/test_pakete.sql"
 
 # ---------------------------------------------------------------- 3. Pi gegen neue und alte Datenbank
 if [[ -f "$HIER/pi_ablauf.py" ]]; then

@@ -34,6 +34,12 @@
 --     von Supabase (/object/upload/sign) werden nur beim Erzeugen geprüft (siehe docs/13-portal.md).
 --   * Neben den erlaubenden Regeln (to authenticated) stehen einschränkende Regeln (as restrictive, für
 --     alle Rollen): Auch eine künftige, zu weit gefasste Regel auf storage.objects öffnet den Bucket nicht.
+--
+-- Update-Pakete für die Pis (Entscheid E9)
+--   * Öffentlicher Storage-Bucket «pi-pakete»: <kanal>/freigabe.txt und <kanal>/solarmaa-dash-<version>.tar.gz.
+--     Die Pakete enthalten keine Geheimnisse; geschützt sind sie durch die Signatur, die jeder Pi prüft.
+--   * Hochladen nur über das Supabase-Dashboard. Für anon und authenticated gibt es keine erlaubende Regel,
+--     dazu einschränkende Regeln: Auch eine künftige, zu weit gefasste Regel erlaubt dort kein Schreiben.
 
 create extension if not exists pgcrypto with schema extensions;
 
@@ -611,3 +617,24 @@ create policy anlagedoku_schranke_aendern on storage.objects as restrictive for 
 drop policy if exists anlagedoku_schranke_loeschen on storage.objects;
 create policy anlagedoku_schranke_loeschen on storage.objects as restrictive for delete to public
   using (bucket_id is distinct from 'anlagedoku' or public.darf_dokument(name, 'loeschen'));
+
+-- ---------------------------------------------------------------- Update-Pakete: Storage-Bucket und Regeln (E9)
+-- Öffentlich lesbar (Download ohne Anmeldung über /storage/v1/object/public/pi-pakete/…). Grenze 20 MB pro
+-- Datei (ein Paket hat heute rund 0,3 MB). Kein Typfilter: Welchen Typ der Browser beim Hochladen von
+-- .tar.gz und .txt meldet, ist ungeprüft; ein falscher Filter würde nur das Hochladen verhindern, die
+-- Sicherheit kommt von der Signatur. Jedes Einspielen setzt die Werte zurück. (Am echten Projekt
+-- ungeprüft: Hochladen über das Dashboard trotz der einschränkenden Regeln, es nutzt die Dienstrolle.)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('pi-pakete', 'pi-pakete', true, 20971520, null)
+on conflict (id) do update set public = true, file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+-- Keine erlaubende Regel. Einschränkende Regeln für alle Rollen: in «pi-pakete» nie hochladen, ändern, löschen.
+drop policy if exists pakete_schranke_hochladen on storage.objects;
+create policy pakete_schranke_hochladen on storage.objects as restrictive for insert to public
+  with check (bucket_id is distinct from 'pi-pakete');
+drop policy if exists pakete_schranke_aendern on storage.objects;
+create policy pakete_schranke_aendern on storage.objects as restrictive for update to public
+  using (bucket_id is distinct from 'pi-pakete') with check (bucket_id is distinct from 'pi-pakete');
+drop policy if exists pakete_schranke_loeschen on storage.objects;
+create policy pakete_schranke_loeschen on storage.objects as restrictive for delete to public
+  using (bucket_id is distinct from 'pi-pakete');
