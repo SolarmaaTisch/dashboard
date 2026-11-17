@@ -763,6 +763,9 @@ class InstallShTests(unittest.TestCase):
         for pfad in ("/etc/", "/var/", "/opt/", "/usr/local/"):
             skript = skript.replace(pfad, w + pfad)
         skript = skript.replace("[[ $EUID -eq 0 ]] ||", "true ||")
+        rest = "\n".join(z for z in skript.replace(w, "WURZEL").splitlines() if not z.lstrip().startswith("#"))
+        for pfad in ("/etc/", "/var/", "/opt/", "/usr/local/", "/root", "/home"):      # Schutz: nichts ausserhalb
+            self.assertNotRegex(rest, "(?<!WURZEL)" + pfad)
         self.skript = self.repo / "pi/install.sh"
         self.skript.write_text(skript)
         self.bin = self.d / "bin"
